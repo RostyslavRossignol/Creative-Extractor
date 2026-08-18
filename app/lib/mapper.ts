@@ -33,6 +33,8 @@ export type CleanupReport = {
   cleanedColumns: string[];
   alreadyEmptyColumns: string[];
   missingColumns: string[];
+  repairedCreativeTypes: number;
+  clearedDeletedCreativeTypes: number;
 };
 export type NamingScope = "campaign" | "adSet" | "ad";
 export type NamingReplacementReport = {
@@ -244,6 +246,8 @@ export function cleanMetaExport(csv: ParsedCsv): { csv: ParsedCsv; report: Clean
   const alreadyEmptyColumns: string[] = [];
   const missingColumns: string[] = [];
   let cleanedCells = 0;
+  let repairedCreativeTypes = 0;
+  let clearedDeletedCreativeTypes = 0;
 
   for (const column of META_CLEANUP_COLUMNS) {
     const index = csv.headers.indexOf(column);
@@ -262,9 +266,50 @@ export function cleanMetaExport(csv: ParsedCsv): { csv: ParsedCsv; report: Clean
     else alreadyEmptyColumns.push(column);
   }
 
+  // Meta may export POST_DELETED when the post behind an old creative no longer
+  // exists. That marker is not an importable Creative Type: restore a value only
+  // when it is deterministic, otherwise clear the cell. POST_DELETED must never
+  // reach the generated import CSV.
+  const creativeTypeIndex = csv.headers.indexOf("Creative Type");
+  if (creativeTypeIndex >= 0) {
+    const campaignIndex = csv.headers.indexOf("Campaign Name");
+    const adSetIndex = csv.headers.indexOf("Ad Set Name");
+    const isDeletedMarker = (value: string) => value.trim().toLocaleUpperCase() === "POST_DELETED";
+    const groupKey = (row: string[]) => `${campaignIndex >= 0 ? row[campaignIndex] : ""}\u001f${adSetIndex >= 0 ? row[adSetIndex] : ""}`;
+    const validGlobalTypes = new Set<string>();
+    const validTypesByGroup = new Map<string, Set<string>>();
+
+    for (const row of rows) {
+      const value = row[creativeTypeIndex]?.trim() ?? "";
+      if (!value || isDeletedMarker(value)) continue;
+      validGlobalTypes.add(value);
+      const key = groupKey(row);
+      const groupTypes = validTypesByGroup.get(key) ?? new Set<string>();
+      groupTypes.add(value);
+      validTypesByGroup.set(key, groupTypes);
+    }
+
+    for (const row of rows) {
+      if (!isDeletedMarker(row[creativeTypeIndex] ?? "")) continue;
+      const groupTypes = validTypesByGroup.get(groupKey(row));
+      const replacement = groupTypes?.size === 1
+        ? [...groupTypes][0]
+        : validGlobalTypes.size === 1
+          ? [...validGlobalTypes][0]
+          : null;
+      if (replacement) {
+        row[creativeTypeIndex] = replacement;
+        repairedCreativeTypes += 1;
+      } else {
+        row[creativeTypeIndex] = "";
+        clearedDeletedCreativeTypes += 1;
+      }
+    }
+  }
+
   return {
     csv: { ...csv, rows, delimiter: ",", linebreak: "\r\n", hadBom: true, encoding: "utf-8" },
-    report: { cleanedCells, cleanedColumns, alreadyEmptyColumns, missingColumns },
+    report: { cleanedCells, cleanedColumns, alreadyEmptyColumns, missingColumns, repairedCreativeTypes, clearedDeletedCreativeTypes },
   };
 }
 

@@ -5,9 +5,9 @@ import { createPortal } from "react-dom";
 import JSZip from "jszip";
 import {
   AlertCircle, ArrowRight, Check, CheckCircle2, ChevronDown, CircleHelp,
-  Clipboard, Code2, Database, Download, FileArchive, FileSpreadsheet,
+  BookOpen, Clipboard, Code2, Database, Download, FileArchive, FileSpreadsheet,
   Image as ImageIcon, KeyRound, Link2, Loader2, LockKeyhole, Play, RotateCcw,
-  Search, Settings2, ShieldCheck, Sparkles, Trash2, UploadCloud, Video, X,
+  Search, Server, Settings2, ShieldCheck, Sparkles, Trash2, UploadCloud, Video, X,
 } from "lucide-react";
 import {
   buildMappings, cleanMetaExport, createCreativeFile, createOutputRows, createReportCsv,
@@ -34,8 +34,9 @@ const statusLabels: Record<MappingStatus, string> = {
 };
 type Filter = "all" | "ready" | "errors" | "manual";
 const TOKEN_STORAGE_KEY = "creative-extractor:meta-access-token";
-// Add the optimized file to public/guide.mp4 and change this value to "/guide.mp4".
-const GUIDE_VIDEO_SRC: string | null = null;
+const ASSET_BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH?.replace(/\/$/, "") ?? "";
+const GUIDE_VIDEO_SRC: string | null = `${ASSET_BASE_PATH}/creative-extractor-guide.mp4`;
+const GUIDE_VIDEO_POSTER = `${ASSET_BASE_PATH}/creative-extractor-guide-poster.jpg`;
 const defaultNamingScopes: Record<NamingScope, boolean> = { campaign: true, adSet: true, ad: true };
 
 function formatBytes(bytes: number) {
@@ -262,6 +263,7 @@ export default function Home() {
   const [query, setQuery] = useState("");
   const [manualOverrides, setManualOverrides] = useState<Record<number, string>>({});
   const [showSettings, setShowSettings] = useState(false);
+  const [showInstructions, setShowInstructions] = useState(false);
   const [token, setToken] = useState("");
   const [tokenStorageReady, setTokenStorageReady] = useState(false);
   const [cleanupReport, setCleanupReport] = useState<CleanupReport | null>(null);
@@ -314,6 +316,20 @@ export default function Home() {
       // The app still works; only persistence for this tab is unavailable.
     }
   }, [token, tokenStorageReady]);
+
+  useEffect(() => {
+    if (!showInstructions) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setShowInstructions(false);
+    };
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [showInstructions]);
 
   const loadCsv = useCallback(async (file: File) => {
     if (!/\.(csv|txt)$/i.test(file.name)) { setError("Для таблицы нужен файл CSV или TXT."); return; }
@@ -486,8 +502,30 @@ export default function Home() {
     <div className="ambient-background" aria-hidden="true"><span className="ambient-orb ambient-orb--one" /><span className="ambient-orb ambient-orb--two" /><span className="ambient-orb ambient-orb--three" /><span className="ambient-grid" /><span className="ambient-glow ambient-glow--one" /><span className="ambient-glow ambient-glow--two" /></div>
     <header className="topbar">
       <a className="brand" href="#top" aria-label="Creative Extractor"><span className="brand-mark"><Sparkles size={18} /></span><span>Creative Extractor</span><span className="product-chip">Meta CSV</span></a>
-      <div className="privacy-pill"><LockKeyhole size={14} /> Файлы остаются на устройстве</div>
+      <div className="topbar-actions">
+        <button className="instructions-button" type="button" onClick={() => setShowInstructions(true)}><span className="instructions-icon"><BookOpen size={16} /></span> Инструкция</button>
+        <div className="privacy-pill"><LockKeyhole size={14} /> Файлы остаются на устройстве</div>
+      </div>
     </header>
+
+    {showInstructions && <div className="instructions-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowInstructions(false); }}>
+      <section className="instructions-dialog" role="dialog" aria-modal="true" aria-labelledby="instructions-title">
+        <div className="instructions-head"><div className="instructions-heading-icon"><BookOpen size={22} /></div><div><span>Краткая инструкция</span><h2 id="instructions-title">Как подготовить CSV с креативами</h2></div><button type="button" onClick={() => setShowInstructions(false)} aria-label="Закрыть инструкцию"><X size={19} /></button></div>
+        <div className="instructions-ip"><Server size={20} /><div><strong>Сначала откройте правильное рабочее окружение</strong><p>Открывайте Creative Extractor в том же профиле и через тот же VDS/IP, которые закреплены за рекламным аккаунтом (King) и используются для входа в Ads Manager. Это сохраняет последовательность рабочей сессии, но само по себе не гарантирует отсутствие проверок или ограничений Meta.</p></div></div>
+        <ol className="instructions-steps">
+          <li><b>1</b><div><strong>Загрузите креативы в Meta</strong><span>Сначала добавьте нужные JPG/PNG в медиатеку правильного рекламного кабинета, сохранив исходные названия файлов.</span></div></li>
+          <li><b>2</b><div><strong>Добавьте CSV и ZIP</strong><span>Загрузите оригинальный экспорт кампании из Meta и ZIP с теми же креативами. Очистка технических полей выполнится автоматически.</span></div></li>
+          <li><b>3</b><div><strong>Проверьте нейминги</strong><span>При необходимости массово замените дату, модель или ID. Затем проверьте автоматическое распределение по языкам и вариантам.</span></div></li>
+          <li><b>4</b><div><strong>Получите Image Hash</strong><span>Проверьте ID кабинета, вставьте токен с ads_read или ads_management и нажмите «Start — получить хеши».</span></div></li>
+          <li><b>5</b><div><strong>Устраните конфликты</strong><span>Если строка не сопоставилась однозначно, найдите и выберите правильный креатив вручную. Перед скачиванием все строки должны быть готовы.</span></div></li>
+          <li><b>6</b><div><strong>Скачайте и импортируйте CSV</strong><span>Скачайте готовый файл, импортируйте его в Ads Manager и обязательно проверьте черновик перед публикацией.</span></div></li>
+        </ol>
+        <div className="instructions-foot"><LockKeyhole size={15} /> Не вставляйте токен в чаты или публичные документы. На сайте он хранится только в текущей вкладке.</div>
+        <button className="instructions-primary" type="button" onClick={() => setShowInstructions(false)}>Понятно, начать работу</button>
+      </section>
+    </div>}
+
+    <section className="session-ip-notice" aria-label="Важное условие рабочего окружения"><Server size={20} /><div><strong>Открывайте сайт из рабочего профиля через закреплённый VDS/IP</strong><span>Используйте то же окружение, из которого вы входите в Ads Manager нужного аккаунта (King).</span></div><button type="button" onClick={() => setShowInstructions(true)}>Подробнее</button></section>
 
     <section className="hero" id="top">
       <div className="hero-copy"><div className="eyebrow">Автоматизация CSV для Meta Ads</div><h1>Подготовьте кампанию и креативы за несколько кликов</h1><p>Загрузите исходный экспорт Meta. Сервис очистит технические привязки, поможет массово обновить нейминги, распределит креативы и подготовит готовый CSV.</p></div>
@@ -503,7 +541,7 @@ export default function Home() {
           <div className="guide-points"><span><b>01</b> Загрузка CSV</span><span><b>02</b> Нейминги и ZIP</span><span><b>03</b> Сверка и экспорт</span></div>
         </div>
         <div className={`guide-media ${GUIDE_VIDEO_SRC ? "has-video" : "is-pending"}`}>
-          {GUIDE_VIDEO_SRC ? <video className="guide-video" controls preload="metadata" playsInline>
+          {GUIDE_VIDEO_SRC ? <video className="guide-video" controls preload="metadata" playsInline poster={GUIDE_VIDEO_POSTER} aria-label="Видеоинструкция Creative Extractor">
             <source src={GUIDE_VIDEO_SRC} type="video/mp4" />
             Ваш браузер не поддерживает воспроизведение видео.
           </video> : <div className="guide-placeholder"><span className="guide-play"><Play size={26} fill="currentColor" /></span><strong>Видео готовится</strong><small>После добавления гайда он будет доступен здесь со звуком и полноэкранным режимом.</small></div>}
@@ -525,7 +563,7 @@ export default function Home() {
           <div><div className="section-kicker">Подготовка таблицы</div><h2>Очистка и массовая замена неймингов</h2><p>Технические поля очищаются автоматически. Поиск и замена работают только в Campaign Name, Ad Set Name и Ad Name — остальные настройки кампании не меняются.</p></div>
           <div className="cleanup-badge"><CheckCircle2 size={18} /><span><b>{cleanupReport.cleanedCells ? `Очищено ${cleanupReport.cleanedCells} значений` : "Файл уже очищен"}</b>{sourceFormat} → UTF-8 CSV</span></div>
         </div>
-        <div className="cleanup-summary"><ShieldCheck size={17} /><div><b>15 защищённых технических колонок</b><span>Удалены старые ID кампании, адсетов и объявлений, даты запуска, ссылки предпросмотра, пиксели, старые Image Hash / Image File Name и привязки Instagram. Бюджеты, таргетинг, тексты и остальные параметры сохранены.</span></div></div>
+        <div className="cleanup-summary"><ShieldCheck size={17} /><div><b>15 защищённых технических колонок</b><span>Удалены старые ID кампании, адсетов и объявлений, даты запуска, ссылки предпросмотра, пиксели, старые Image Hash / Image File Name и привязки Instagram. Бюджеты, таргетинг, тексты и остальные параметры сохранены.{cleanupReport.repairedCreativeTypes > 0 ? ` Восстановлен Creative Type в ${cleanupReport.repairedCreativeTypes} строках с маркером POST_DELETED.` : ""}{cleanupReport.clearedDeletedCreativeTypes > 0 ? ` Очищен невалидный Creative Type в ${cleanupReport.clearedDeletedCreativeTypes} строках, где безопасное значение определить нельзя.` : ""}</span></div></div>
         {cleanupReport.missingColumns.length > 0 && <div className="cleanup-warning"><AlertCircle size={15} /> В загруженном файле отсутствуют {cleanupReport.missingColumns.length} ожидаемых колонок. Проверьте, что это полный экспорт Meta Ads.</div>}
 
         <div className="rename-workspace">
@@ -613,6 +651,6 @@ export default function Home() {
     </section>
 
     <section className="how-it-works"><div><span>01</span><strong>Загрузите экспорт Meta</strong><p>Поддерживается оригинальный UTF-16/TAB без ручной конвертации.</p></div><div><span>02</span><strong>Обновите нейминги</strong><p>Очистка выполнится автоматически, а массовая замена работает как Ctrl+H.</p></div><div><span>03</span><strong>Добавьте ZIP и хэши</strong><p>Сервис распределит языки, варианты и найдёт изображения в кабинете.</p></div><div><span>04</span><strong>Скачайте CSV</strong><p>Готовый файл можно сразу импортировать в Ads Manager.</p></div></section>
-    <footer><span>Creative Extractor · v1.4</span><span>Файлы обрабатываются локально. Токен хранится только до закрытия текущей вкладки.</span></footer>
+    <footer><span>Creative Extractor · v1.5.1</span><span>Файлы обрабатываются локально. Токен хранится только до закрытия текущей вкладки.</span></footer>
   </main>;
 }

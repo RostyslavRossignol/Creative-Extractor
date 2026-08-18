@@ -53,8 +53,46 @@ test("cleans only the 15 verified technical Meta columns and normalizes the outp
   assert.equal(cleaned.csv.rows[0][headers.indexOf("Countries")], "IT, ES");
   assert.equal(cleaned.csv.rows[0][headers.indexOf("Body")], "Text");
   assert.equal(cleaned.report.cleanedCells, 15);
+  assert.equal(cleaned.report.repairedCreativeTypes, 0);
+  assert.equal(cleaned.report.clearedDeletedCreativeTypes, 0);
   assert.equal(cleaned.csv.delimiter, ",");
   assert.equal(cleaned.csv.encoding, "utf-8");
+});
+
+test("repairs POST_DELETED Creative Type from a valid sibling without changing other fields", () => {
+  const csv: ParsedCsv = {
+    fileName: "meta.csv",
+    headers: ["Campaign Name", "Ad Set Name", "Ad Name", "Creative Type", "Body"],
+    rows: [
+      ["Campaign", "Italian", "Ad 1", "Link Page Post Ad", "Text 1"],
+      ["Campaign", "Italian", "Ad 2", "POST_DELETED", "Text 2"],
+      ["Campaign", "French", "Ad 3", "POST_DELETED", "Text 3"],
+    ],
+    delimiter: "\t", linebreak: "\r\n", hadBom: true, encoding: "utf-16le", warnings: [],
+  };
+  const cleaned = cleanMetaExport(csv);
+  assert.deepEqual(cleaned.csv.rows.map((row) => row[3]), ["Link Page Post Ad", "Link Page Post Ad", "Link Page Post Ad"]);
+  assert.deepEqual(cleaned.csv.rows.map((row) => row[4]), ["Text 1", "Text 2", "Text 3"]);
+  assert.equal(cleaned.report.repairedCreativeTypes, 2);
+  assert.equal(cleaned.report.clearedDeletedCreativeTypes, 0);
+});
+
+test("clears POST_DELETED when a valid Creative Type is ambiguous", () => {
+  const csv: ParsedCsv = {
+    fileName: "meta.csv",
+    headers: ["Campaign Name", "Ad Set Name", "Ad Name", "Creative Type"],
+    rows: [
+      ["Campaign", "Italian", "Ad 1", "Link Page Post Ad"],
+      ["Campaign", "Italian", "Ad 2", "Video Page Post Ad"],
+      ["Campaign", "Italian", "Ad 3", "POST_DELETED"],
+    ],
+    delimiter: "\t", linebreak: "\r\n", hadBom: true, encoding: "utf-16le", warnings: [],
+  };
+  const cleaned = cleanMetaExport(csv);
+  assert.equal(cleaned.csv.rows[2][3], "");
+  assert.equal(cleaned.report.repairedCreativeTypes, 0);
+  assert.equal(cleaned.report.clearedDeletedCreativeTypes, 1);
+  assert.equal(cleaned.csv.rows.flat().includes("POST_DELETED"), false);
 });
 
 test("find and replace is limited to the three naming columns", () => {
