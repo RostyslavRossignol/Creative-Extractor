@@ -6,19 +6,20 @@ import JSZip from "jszip";
 import {
   AlertCircle, ArrowRight, Check, CheckCircle2, ChevronDown, CircleHelp,
   BookOpen, Clipboard, Code2, Database, Download, FileArchive, FileSpreadsheet,
-  Image as ImageIcon, KeyRound, Link2, Loader2, LockKeyhole, Play, RotateCcw,
+  Image as ImageIcon, KeyRound, Link2, Loader2, LockKeyhole, RefreshCw, RotateCcw,
   Search, Server, Settings2, ShieldCheck, Sparkles, Trash2, UploadCloud, Video, X,
 } from "lucide-react";
 import {
-  buildMappings, cleanMetaExport, createCreativeFile, createOutputRows, createReportCsv,
+  applyCampaignCsvSettings, buildMappings, cleanMetaExport, createCreativeFile, createOutputRows, createReportCsv,
   detectColumns, NAMING_COLUMNS, outputFileName, parseCsvFile, replaceInNamingColumns, serializeCsv,
-  type CleanupReport, type ColumnSelection, type CreativeFile, type EncodingMode,
+  type CampaignCsvUpdateReport, type CleanupReport, type ColumnSelection, type CreativeFile, type EncodingMode,
   type MappingOptions, type MappingStatus, type NamingReplacementReport,
   type NamingScope, type ParsedCsv,
 } from "./lib/mapper";
 import {
-  fetchAllAdImages, inferAdAccountIds, matchFilesToMetaImages, uploadAdImage,
-  type GraphVersion, type MetaAdImage, type MetaApiLogEntry, type MetaImageMatch,
+  extractAdAccountId, fetchAccessibleAdAccounts, fetchAdAccountPages, fetchAdAccountPixels, fetchAllAdImages,
+  inferAdAccountIds, isMetaAdAccountActive, matchFilesToMetaImages, metaAdAccountStatusLabel, runWithConcurrency, uploadAdImage, verifyAdAccountAccess,
+  type GraphVersion, type MetaAdAccount, type MetaAdImage, type MetaApiLogEntry, type MetaImageMatch, type MetaPage, type MetaPixel,
 } from "./lib/meta-api";
 
 const defaultOptions: MappingOptions = {
@@ -44,8 +45,11 @@ type MetaUploadItem = {
 };
 const TOKEN_STORAGE_KEY = "creative-extractor:meta-access-token";
 const ASSET_BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH?.replace(/\/$/, "") ?? "";
-const GUIDE_VIDEO_SRC: string | null = `${ASSET_BASE_PATH}/creative-extractor-guide.mp4`;
-const GUIDE_VIDEO_POSTER = `${ASSET_BASE_PATH}/creative-extractor-guide-poster.jpg`;
+const SIMPLE_GUIDE_VIDEO_SRC = `${ASSET_BASE_PATH}/creative-extractor-simple-guide.mp4`;
+const SIMPLE_GUIDE_VIDEO_POSTER = `${ASSET_BASE_PATH}/creative-extractor-simple-guide-poster.jpg`;
+const AUTO_GUIDE_VIDEO_SRC = `${ASSET_BASE_PATH}/creative-extractor-auto-guide.mp4`;
+const AUTO_GUIDE_VIDEO_POSTER = `${ASSET_BASE_PATH}/creative-extractor-auto-guide-poster.jpg`;
+const META_UPLOAD_CONCURRENCY = 3;
 const defaultNamingScopes: Record<NamingScope, boolean> = { campaign: true, adSet: true, ad: true };
 
 function formatBytes(bytes: number) {
@@ -53,6 +57,18 @@ function formatBytes(bytes: number) {
   const units = ["Б", "КБ", "МБ", "ГБ"];
   const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
   return `${(bytes / 1024 ** index).toFixed(index ? 1 : 0)} ${units[index]}`;
+}
+
+function csvListValue(csv: ParsedCsv, column: string): string {
+  const index = csv.headers.indexOf(column);
+  if (index < 0) return "";
+  const tokens = new Set<string>();
+  csv.rows.forEach((row) => String(row[index] ?? "").split(/[,;]+/).map((item) => item.trim()).filter(Boolean).forEach((item) => tokens.add(item)));
+  return [...tokens].join(", ");
+}
+
+function splitListValue(value: string): string[] {
+  return [...new Set(value.split(/[,;\n]+/).map((item) => item.trim()).filter(Boolean))];
 }
 function downloadText(content: string, fileName: string, type = "text/csv;charset=utf-8") {
   downloadBlob(new Blob([content], { type }), fileName);
@@ -295,6 +311,18 @@ export default function Home() {
   const [apiLogs, setApiLogs] = useState<MetaApiLogEntry[]>([]);
   const [showApiLogs, setShowApiLogs] = useState(false);
   const [logCopied, setLogCopied] = useState(false);
+  const [resourceBusy, setResourceBusy] = useState<"accounts" | "assets" | null>(null);
+  const [metaAccounts, setMetaAccounts] = useState<MetaAdAccount[]>([]);
+  const [unavailableAccountCount, setUnavailableAccountCount] = useState(0);
+  const [accountSearch, setAccountSearch] = useState("");
+  const [metaPixels, setMetaPixels] = useState<MetaPixel[]>([]);
+  const [metaPages, setMetaPages] = useState<MetaPage[]>([]);
+  const [selectedPixelId, setSelectedPixelId] = useState("");
+  const [selectedPageId, setSelectedPageId] = useState("");
+  const [countriesInput, setCountriesInput] = useState("");
+  const [localesInput, setLocalesInput] = useState("");
+  const [campaignUpdateReport, setCampaignUpdateReport] = useState<CampaignCsvUpdateReport | null>(null);
+  const [campaignUndoCsv, setCampaignUndoCsv] = useState<ParsedCsv | null>(null);
 
   const clearPreviewUrls = useCallback(() => {
     previewUrlListRef.current.forEach((url) => URL.revokeObjectURL(url));
@@ -354,6 +382,9 @@ export default function Home() {
       setCsv(cleaned.csv); setCsvSourceFile(file); setColumns(detected); setManualOverrides({});
       setCleanupReport(cleaned.report); setSourceFormat(`${parsed.encoding.toUpperCase()} · ${parsed.delimiter === "\t" ? "TAB" : "CSV"}`);
       setRenameFind(""); setRenameReplace(""); setRenameReport(null); setRenameUndoCsv(null);
+      setCountriesInput(csvListValue(cleaned.csv, "Countries")); setLocalesInput(csvListValue(cleaned.csv, "Locales"));
+      setSelectedPixelId(""); setSelectedPageId(""); setCampaignUpdateReport(null); setCampaignUndoCsv(null);
+      setMetaAccounts([]); setUnavailableAccountCount(0); setAccountSearch(""); setMetaPixels([]); setMetaPages([]);
       setMetaImages([]); setMetaMatches([]); setUploadResults([]); setMetaCheckedAt(null); setApiLogs([]); setShowApiLogs(false);
       if (inferredIds.length === 1) { setAccountId(inferredIds[0]); setAccountIdSource("auto"); }
       else { setAccountId(""); setAccountIdSource(""); }
@@ -459,6 +490,71 @@ export default function Home() {
       return { scope, header, count: values.length, values };
     });
   }, [csv]);
+  const filteredAccounts = useMemo(() => {
+    const needle = accountSearch.trim().toLocaleLowerCase();
+    if (!needle) return metaAccounts;
+    return metaAccounts.filter((account) => `${account.name ?? ""} ${account.account_id ?? account.id} ${account.business?.name ?? ""}`.toLocaleLowerCase().includes(needle));
+  }, [metaAccounts, accountSearch]);
+  const selectedAccount = useMemo(() => metaAccounts.find((account) => (account.account_id || account.id).replace(/^act_/i, "") === accountId) ?? null, [metaAccounts, accountId]);
+
+  const handleDiscoverAccounts = async () => {
+    if (!token.trim() || resourceBusy) return;
+    setResourceBusy("accounts"); setError(null); setApiLogs([]); setShowApiLogs(true); setLogCopied(false);
+    try {
+      const discovery = await fetchAccessibleAdAccounts({ token, version: graphVersion, onLog: (entry) => setApiLogs((current) => [...current, entry]) });
+      setMetaAccounts(discovery.accounts); setUnavailableAccountCount(discovery.unavailable);
+      if (!discovery.accounts.length) setError("Токен не вернул ни одного рекламного кабинета. Проверьте назначенные системному пользователю ресурсы.");
+    } catch (reason) {
+      setMetaAccounts([]); setUnavailableAccountCount(0);
+      setError(reason instanceof Error ? reason.message : "Не удалось получить рекламные кабинеты.");
+    } finally { setResourceBusy(null); }
+  };
+
+  const selectMetaAccount = (account: MetaAdAccount) => {
+    const id = (account.account_id || account.id).replace(/^act_/i, "");
+    setAccountId(id); setAccountIdSource("manual"); setMetaPixels([]); setMetaPages([]); setSelectedPixelId(""); setSelectedPageId("");
+    resetMetaResults(); setError(null);
+  };
+
+  const handleLoadAccountAssets = async () => {
+    if (!accountId || !token || resourceBusy) return;
+    setResourceBusy("assets"); setError(null); setApiLogs([]); setShowApiLogs(true); setLogCopied(false);
+    try {
+      const accountAccess = await verifyAdAccountAccess({ accountId, token, version: graphVersion, onLog: (entry) => setApiLogs((current) => [...current, entry]) });
+      const [pixels, pages] = await Promise.all([
+        fetchAdAccountPixels({ accountId, token, version: graphVersion, onLog: (entry) => setApiLogs((current) => [...current, entry]) }),
+        fetchAdAccountPages({ accountId, businessId: selectedAccount?.business?.id || accountAccess.business?.id, token, version: graphVersion, onLog: (entry) => setApiLogs((current) => [...current, entry]) }),
+      ]);
+      setMetaPixels([...pixels].sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id, undefined, { numeric: true })));
+      setMetaPages([...pages].sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id, undefined, { numeric: true })));
+      if (!pages.length) setError("Кабинет доступен, но Meta не вернула ни одной Facebook Page из доступных источников. Назначьте нужную страницу системному пользователю в Business Settings и проверьте business_management в токене.");
+      else if (!pixels.length) setError("Страницы получены, но Meta не вернула пиксели. Проверьте назначение пикселя системному пользователю.");
+    } catch (reason) {
+      setMetaPixels([]); setMetaPages([]);
+      setError(reason instanceof Error ? reason.message : "Не удалось получить пиксели и страницы кабинета.");
+    } finally { setResourceBusy(null); }
+  };
+
+  const handleApplyCampaignSettings = () => {
+    if (!csv) return;
+    const countries = splitListValue(countriesInput).map((country) => country.toLocaleUpperCase());
+    const invalidCountries = countries.filter((country) => !/^[A-Z]{2}$/.test(country));
+    if (csv.headers.includes("Countries") && !countries.length) { setError("Добавьте хотя бы одну страну в формате двухбуквенного кода, например IT, ES или DE."); return; }
+    if (invalidCountries.length) { setError(`Некорректные коды стран: ${invalidCountries.join(", ")}. Используйте двухбуквенные ISO-коды.`); return; }
+    const result = applyCampaignCsvSettings(csv, {
+      countries: csv.headers.includes("Countries") ? countries : undefined,
+      locales: csv.headers.includes("Locales") ? splitListValue(localesInput) : undefined,
+      pixelId: selectedPixelId || undefined,
+      pageId: selectedPageId || undefined,
+    });
+    setCampaignUndoCsv(csv); setCsv(result.csv); setCampaignUpdateReport(result.report); setError(null);
+  };
+
+  const undoCampaignSettings = () => {
+    if (!campaignUndoCsv) return;
+    setCsv(campaignUndoCsv); setCountriesInput(csvListValue(campaignUndoCsv, "Countries")); setLocalesInput(csvListValue(campaignUndoCsv, "Locales"));
+    setCampaignUndoCsv(null); setCampaignUpdateReport(null); setError(null);
+  };
 
   const handleMetaSync = async () => {
     if (!csv || blockers || !accountId.trim() || !token.trim()) return;
@@ -494,6 +590,17 @@ export default function Home() {
     if (!targetIds.size) return;
 
     setBusy("meta-upload"); setError(null); setUploadResults(initial); setMetaCheckedAt(null); setApiLogs([]); setShowApiLogs(true); setLogCopied(false);
+    try {
+      await verifyAdAccountAccess({
+        accountId, token, version: graphVersion,
+        onLog: (entry) => setApiLogs((entries) => [...entries, entry]),
+      });
+    } catch (reason) {
+      setUploadResults([]);
+      setError(reason instanceof Error ? reason.message : "Не удалось подтвердить доступ к рекламному кабинету.");
+      setBusy(null);
+      return;
+    }
     const current = [...initial];
     const publish = () => {
       setUploadResults([...current]);
@@ -504,31 +611,31 @@ export default function Home() {
       setMetaImages(current.flatMap((item) => item.image ? [item.image] : []));
     };
 
-    for (let index = 0; index < current.length; index += 1) {
-      const item = current[index];
-      if (!targetIds.has(item.fileId)) continue;
-      const file = creativeUploadFiles[item.fileId];
-      item.attempts += 1;
-      if (!file) {
-        item.status = "failed";
-        item.error = "Не удалось прочитать изображение из ZIP. Загрузите архив повторно.";
+    const queue = current.map((_, index) => index).filter((index) => targetIds.has(current[index].fileId));
+    await runWithConcurrency(queue, META_UPLOAD_CONCURRENCY, async (index) => {
+        const item = current[index];
+        const file = creativeUploadFiles[item.fileId];
+        item.attempts += 1;
+        if (!file) {
+          item.status = "failed";
+          item.error = "Не удалось прочитать изображение из ZIP. Загрузите архив повторно.";
+          publish();
+          return;
+        }
+        item.status = "uploading"; item.error = null; publish();
+        try {
+          item.image = await uploadAdImage({
+            accountId, token, file, version: graphVersion, requestNumber: index + 1,
+            onLog: (entry) => setApiLogs((entries) => [...entries, entry]),
+          });
+          item.status = "uploaded";
+        } catch (reason) {
+          item.status = "failed";
+          item.image = null;
+          item.error = reason instanceof Error ? reason.message : "Не удалось загрузить изображение в Meta.";
+        }
         publish();
-        continue;
-      }
-      item.status = "uploading"; item.error = null; publish();
-      try {
-        item.image = await uploadAdImage({
-          accountId, token, file, version: graphVersion, requestNumber: index + 1,
-          onLog: (entry) => setApiLogs((entries) => [...entries, entry]),
-        });
-        item.status = "uploaded";
-      } catch (reason) {
-        item.status = "failed";
-        item.image = null;
-        item.error = reason instanceof Error ? reason.message : "Не удалось загрузить изображение в Meta.";
-      }
-      publish();
-    }
+    });
     setMetaCheckedAt(new Date());
     const failed = current.filter((item) => item.status === "failed").length;
     if (failed) setError(`Не удалось загрузить ${failed} из ${current.length} изображений. Исправьте причину и нажмите «Повторить ошибки».`);
@@ -571,7 +678,7 @@ export default function Home() {
   };
   const clearToken = () => {
     try { window.sessionStorage.removeItem(TOKEN_STORAGE_KEY); } catch {}
-    setToken(""); resetMetaResults();
+    setToken(""); setMetaAccounts([]); setUnavailableAccountCount(0); setMetaPixels([]); setMetaPages([]); setSelectedPixelId(""); setSelectedPageId(""); resetMetaResults();
   };
   const reset = () => {
     clearPreviewUrls();
@@ -580,6 +687,8 @@ export default function Home() {
     setManualOverrides({}); setError(null); setFilter("all"); setQuery(""); setAccountId("");
     setCleanupReport(null); setSourceFormat(""); setRenameFind(""); setRenameReplace(""); setRenameScopes(defaultNamingScopes); setRenameReport(null); setRenameUndoCsv(null);
     setAccountIdSource(""); setMetaImages([]); setMetaMatches([]); setMetaCheckedAt(null); setApiLogs([]); setShowApiLogs(false); setLogCopied(false);
+    setResourceBusy(null); setMetaAccounts([]); setUnavailableAccountCount(0); setAccountSearch(""); setMetaPixels([]); setMetaPages([]);
+    setSelectedPixelId(""); setSelectedPageId(""); setCountriesInput(""); setLocalesInput(""); setCampaignUpdateReport(null); setCampaignUndoCsv(null);
   };
 
   return <main>
@@ -594,22 +703,85 @@ export default function Home() {
 
     {showInstructions && <div className="instructions-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowInstructions(false); }}>
       <section className="instructions-dialog" role="dialog" aria-modal="true" aria-labelledby="instructions-title">
-        <div className="instructions-head"><div className="instructions-heading-icon"><BookOpen size={22} /></div><div><span>Краткая инструкция</span><h2 id="instructions-title">Как подготовить CSV с креативами</h2></div><button type="button" onClick={() => setShowInstructions(false)} aria-label="Закрыть инструкцию"><X size={19} /></button></div>
-        <div className="instructions-ip"><Server size={20} /><div><strong>Сначала откройте правильное рабочее окружение</strong><p>Открывайте Creative Extractor в том же профиле и через тот же VDS/IP, которые закреплены за рекламным аккаунтом (King) и используются для входа в Ads Manager. Это сохраняет последовательность рабочей сессии, но само по себе не гарантирует отсутствие проверок или ограничений Meta.</p></div></div>
-        <ol className="instructions-steps">
-          <li><b>1</b><div><strong>Загрузите креативы в Meta</strong><span>Сначала добавьте нужные JPG/PNG в медиатеку правильного рекламного кабинета, сохранив исходные названия файлов.</span></div></li>
-          <li><b>2</b><div><strong>Добавьте CSV и ZIP</strong><span>Загрузите оригинальный экспорт кампании из Meta и ZIP с теми же креативами. Очистка технических полей выполнится автоматически.</span></div></li>
-          <li><b>3</b><div><strong>Проверьте нейминги</strong><span>Название языка или ваш собственный языковой маркер должны одинаково присутствовать в объявлении и имени креатива. Регистр не важен: Catalan и catalan считаются совпадением. Затем проверьте номера вариантов.</span></div></li>
-          <li><b>4</b><div><strong>Получите Image Hash</strong><span>Выберите режим: найдите уже загруженные изображения или загрузите JPG/PNG из ZIP прямо в Meta. Для загрузки нужен токен с ads_management.</span></div></li>
-          <li><b>5</b><div><strong>Устраните конфликты</strong><span>Если строка не сопоставилась однозначно, найдите и выберите правильный креатив вручную. Перед скачиванием все строки должны быть готовы.</span></div></li>
-          <li><b>6</b><div><strong>Скачайте и импортируйте CSV</strong><span>Скачайте готовый файл, импортируйте его в Ads Manager и обязательно проверьте черновик перед публикацией.</span></div></li>
-        </ol>
+        <div className="instructions-head"><div className="instructions-heading-icon"><BookOpen size={22} /></div><div><span>Версия 1.8.0</span><h2 id="instructions-title">Подготовка CSV и загрузка креативов</h2></div><button type="button" onClick={() => setShowInstructions(false)} aria-label="Закрыть инструкцию"><X size={19} /></button></div>
+        <div className="instructions-ip"><Server size={20} /><div><strong>Сначала откройте нужный профиль в приложении AdsPower</strong><p>Открывайте Creative Extractor внутри того же браузерного профиля AdsPower и с того же закреплённого IP/прокси, с которых вы входите в Ads Manager и выполняете залив в нужный рекламный аккаунт (King). Профиль AdsPower и его IP должны соответствовать именно тому аккаунту, с которого вы заливаетесь.</p></div></div>
+        <div className="instructions-update"><UploadCloud size={19} /><div><b>Новое: автоматическая загрузка изображений</b><span>JPG и PNG из ZIP теперь можно загрузить прямо в выбранный рекламный кабинет. Старый режим поиска уже загруженных изображений также полностью сохранён.</span></div></div>
+
+        <section className="instruction-section">
+          <div className="instruction-section-title"><span>01</span><div><b>Подготовьте файлы</b><small>Общие шаги для обоих режимов</small></div></div>
+          <ol className="instruction-checklist">
+            <li><b>1</b><span>Выгрузите из Meta Ads Manager исходный CSV кампании, которую нужно размножить или обновить.</span></li>
+            <li><b>2</b><span>Соберите JPG/PNG в один ZIP. Название языка и номер варианта должны присутствовать и в Ad Name, и в имени файла. Регистр не важен: <code>Catalan</code> и <code>catalan</code> совпадают.</span></li>
+            <li><b>3</b><span>Загрузите в Creative Extractor сначала CSV, затем ZIP. Проверьте автоматическое сопоставление и исправьте красные строки вручную.</span></li>
+            <li><b>4</b><span>Проверьте ID рекламного кабинета. Можно вставить полную ссылку Ads Manager — сервис возьмёт только параметр <code>act=</code>. Не используйте <code>business_id</code> или <code>global_scope_id</code>.</span></li>
+          </ol>
+        </section>
+
+        <section className="instruction-section instruction-section--token">
+          <div className="instruction-section-title"><span>02</span><div><b>Получите токен системного пользователя</b><small>Настраивается один раз для нужного приложения и кабинетов</small></div></div>
+          <ol className="instruction-checklist">
+            <li><b>1</b><span>Откройте Meta Business Settings нужного бизнес-портфеля и перейдите: <strong>Пользователи → Системные пользователи</strong>.</span></li>
+            <li><b>2</b><span>Выберите существующего системного пользователя, через которого работает ваше приложение.</span></li>
+            <li><b>3</b><span>Нажмите <strong>Назначить ресурсы</strong>, выберите нужный рекламный кабинет и выдайте право управления рекламными кампаниями/полный контроль.</span></li>
+            <li><b>4</b><span>Убедитесь, что нужное Meta-приложение принадлежит или подключено к этому бизнес-портфелю.</span></li>
+            <li><b>5</b><span>Нажмите <strong>Создать токен</strong>, выберите приложение и срок действия <strong>Never / Никогда</strong>, если этот вариант доступен.</span></li>
+            <li><b>6</b><span>Отметьте <code>ads_management</code> и <code>ads_read</code>. Для вашей схемы также можно оставить <code>business_management</code>. Для автоматической загрузки обязательно нужен <code>ads_management</code>.</span></li>
+            <li><b>7</b><span>Скопируйте токен и вставьте его в поле <strong>Access token</strong> на сайте. Не отправляйте токен в чаты и не добавляйте его в GitHub.</span></li>
+          </ol>
+        </section>
+
+        <div className="instruction-mode-grid">
+          <section className="instruction-mode-card instruction-mode-card--find">
+            <div className="instruction-mode-head"><Search size={18} /><div><b>03 · Старый вариант</b><span>«Найти в Meta»</span></div></div>
+            <ol>
+              <li>Заранее загрузите JPG/PNG в тот же рекламный кабинет, сохранив исходные имена файлов.</li>
+              <li>Добавьте CSV и ZIP в Creative Extractor и проверьте сопоставление строк.</li>
+              <li>Укажите ID кабинета или вставьте ссылку Ads Manager с параметром <code>act=</code>.</li>
+              <li>Вставьте токен с <code>ads_read</code> или <code>ads_management</code>.</li>
+              <li>Выберите <strong>«Найти в Meta»</strong> и нажмите <strong>«Найти креативы»</strong>.</li>
+              <li>Устраните строки «Не найдено» или «Конфликт», затем скачайте готовый CSV.</li>
+            </ol>
+          </section>
+          <section className="instruction-mode-card instruction-mode-card--upload">
+            <div className="instruction-mode-head"><UploadCloud size={18} /><div><b>04 · Новый вариант</b><span>«Загрузить в Meta»</span></div></div>
+            <ol>
+              <li>Добавьте CSV и ZIP; заранее загружать изображения в Meta не требуется.</li>
+              <li>Укажите правильный рекламный кабинет через ID или полную ссылку Ads Manager.</li>
+              <li>Вставьте токен с <code>ads_management</code> и доступом системного пользователя к этому кабинету.</li>
+              <li>Выберите <strong>«Загрузить в Meta»</strong> и нажмите кнопку загрузки изображений.</li>
+              <li>Сервис сначала проверит кабинет, затем загрузит JPG/PNG безопасной параллельной очередью. Meta вернёт Image Hash в ответе на каждую загрузку, и сервис сразу запишет его в результат.</li>
+              <li>Если отдельный файл не загрузился, исправьте причину и нажмите <strong>«Повторить ошибки»</strong>.</li>
+              <li>После статуса «Все изображения загружены» скачайте готовый CSV.</li>
+            </ol>
+          </section>
+        </div>
+
+        <section className="instruction-section">
+          <div className="instruction-section-title"><span>05</span><div><b>Настройте ресурсы и таргетинг CSV</b><small>Необязательный раздел перед скачиванием</small></div></div>
+          <ol className="instruction-checklist">
+            <li><b>1</b><span>Нажмите <strong>«Показать мои кабинеты»</strong>. Сервис покажет все кабинеты, доступные токену: активные будут зелёными, а заблокированные или недоступные — красными и недоступными для выбора.</span></li>
+            <li><b>2</b><span>Выберите кабинет карточкой или оставьте ручной ID, затем нажмите <strong>«Загрузить пиксели и страницы»</strong>.</span></li>
+            <li><b>3</b><span>Выберите пиксель и Facebook Page. Страницы отображаются с названием, ID и доступной иконкой.</span></li>
+            <li><b>4</b><span>Отредактируйте <code>Countries</code> двухбуквенными кодами и <code>Locales</code>, затем нажмите <strong>«Применить к CSV»</strong>. Изменения можно отменить.</span></li>
+          </ol>
+        </section>
+
+        <section className="instruction-section">
+          <div className="instruction-section-title"><span>06</span><div><b>Импортируйте результат в Meta</b><small>Финальная проверка перед публикацией</small></div></div>
+          <ol className="instruction-checklist">
+            <li><b>1</b><span>В Ads Manager выберите импорт объявлений и загрузите готовый CSV из Creative Extractor.</span></li>
+            <li><b>2</b><span>Откройте Preview и проверьте названия, изображения, кабинеты и отсутствие ошибок <code>Image Not Found</code>.</span></li>
+            <li><b>3</b><span>Сначала сохраните всё в черновик. Публикуйте только после ручной проверки кампаний, адсетов и объявлений.</span></li>
+          </ol>
+          <p className="instruction-limit"><AlertCircle size={15} /> Автоматическая API-загрузка сейчас поддерживает JPG и PNG. Видео MP4/MOV этим режимом не загружаются.</p>
+        </section>
         <div className="instructions-foot"><LockKeyhole size={15} /> Не вставляйте токен в чаты или публичные документы. На сайте он хранится только в текущей вкладке.</div>
         <button className="instructions-primary" type="button" onClick={() => setShowInstructions(false)}>Понятно, начать работу</button>
       </section>
     </div>}
 
-    <section className="session-ip-notice" aria-label="Важное условие рабочего окружения"><Server size={20} /><div><strong>Открывайте сайт из рабочего профиля через закреплённый VDS/IP</strong><span>Используйте то же окружение, из которого вы входите в Ads Manager нужного аккаунта (King).</span></div><button type="button" onClick={() => setShowInstructions(true)}>Подробнее</button></section>
+    <section className="release-notice" aria-label="Обновление Creative Extractor v1.8.0"><span className="release-badge">Новое · v1.8.0</span><UploadCloud size={22} /><div><strong>Добавлена ускоренная автозагрузка креативов и новая видеоинструкция</strong><span>Открывайте сервис в том же профиле AdsPower и с закреплённого IP/прокси аккаунта, с которого выполняете залив.</span></div><button type="button" onClick={() => setShowInstructions(true)}>Что изменилось</button></section>
+    <section className="session-ip-notice" aria-label="Важное условие рабочего окружения"><Server size={20} /><div><strong>Открывайте сайт в нужном профиле AdsPower и с его IP</strong><span>Используйте профиль AdsPower и закреплённый за ним IP/прокси того аккаунта (King), с которого выполняете залив.</span></div><button type="button" onClick={() => setShowInstructions(true)}>Подробнее</button></section>
 
     <section className="hero" id="top">
       <div className="hero-copy"><div className="eyebrow">Автоматизация CSV для Meta Ads</div><h1>Подготовьте кампанию и креативы за несколько кликов</h1><p>Загрузите исходный экспорт Meta. Сервис очистит технические привязки, поможет массово обновить нейминги, распределит креативы и подготовит готовый CSV.</p></div>
@@ -617,24 +789,37 @@ export default function Home() {
     </section>
 
     <section className="guide-shell" aria-labelledby="guide-title">
-      <div className="guide-card">
+      <div className="guide-card guide-card--library">
         <div className="guide-copy">
-          <div className="section-kicker">Видеоинструкция</div>
-          <h2 id="guide-title">Весь процесс — от экспорта до готового CSV</h2>
-          <p>Короткий практический гайд покажет, как очистить файл, обновить нейминги, сопоставить креативы с Meta и скачать кампанию для импорта.</p>
-          <div className="guide-points"><span><b>01</b> Загрузка CSV</span><span><b>02</b> Нейминги и ZIP</span><span><b>03</b> Сверка и экспорт</span></div>
+          <div className="section-kicker">Два способа работы</div>
+          <h2 id="guide-title">Выберите подходящую видеоинструкцию</h2>
+          <p>Простой способ оставлен как безопасный резерв: изображения загружаются в Meta вручную. Автоинтеграция быстрее — сервис сам отправляет JPG/PNG в кабинет через официальный API.</p>
         </div>
-        <div className={`guide-media ${GUIDE_VIDEO_SRC ? "has-video" : "is-pending"}`}>
-          {GUIDE_VIDEO_SRC ? <video className="guide-video" controls preload="metadata" playsInline poster={GUIDE_VIDEO_POSTER} aria-label="Видеоинструкция Creative Extractor">
-            <source src={GUIDE_VIDEO_SRC} type="video/mp4" />
-            Ваш браузер не поддерживает воспроизведение видео.
-          </video> : <div className="guide-placeholder"><span className="guide-play"><Play size={26} fill="currentColor" /></span><strong>Видео готовится</strong><small>После добавления гайда он будет доступен здесь со звуком и полноэкранным режимом.</small></div>}
+        <div className="guide-video-grid">
+          <article className="guide-video-card">
+            <div className="guide-video-card-head"><span className="guide-mode-badge guide-mode-badge--simple">Резервный способ</span><div><strong>Видео простой интеграции</strong><small>Креативы заранее загружаются в Meta вручную</small></div></div>
+            <div className="guide-media has-video">
+              <video className="guide-video" controls preload="metadata" playsInline poster={SIMPLE_GUIDE_VIDEO_POSTER} aria-label="Видео простой интеграции Creative Extractor">
+                <source src={SIMPLE_GUIDE_VIDEO_SRC} type="video/mp4" />
+                Ваш браузер не поддерживает воспроизведение видео.
+              </video>
+            </div>
+          </article>
+          <article className="guide-video-card guide-video-card--auto">
+            <div className="guide-video-card-head"><span className="guide-mode-badge guide-mode-badge--auto">Новый быстрый способ</span><div><strong>Видео автоинтеграции</strong><small>JPG/PNG загружаются прямо в кабинет через API</small></div></div>
+            <div className="guide-media has-video">
+              <video className="guide-video" controls preload="metadata" playsInline poster={AUTO_GUIDE_VIDEO_POSTER} aria-label="Видео автоматической интеграции Creative Extractor">
+                <source src={AUTO_GUIDE_VIDEO_SRC} type="video/mp4" />
+                Ваш браузер не поддерживает воспроизведение видео.
+              </video>
+            </div>
+          </article>
         </div>
       </div>
     </section>
 
     <section className="workspace-shell">
-      <div className="meta-import-rule"><AlertCircle size={21} /><div><strong>Перед запуском загрузите изображения в медиатеку нужного рекламного кабинета</strong><p>Creative Extractor найдёт загруженные изображения по именам файлов и безопасно свяжет их со строками кампании. Неоднозначные совпадения сервис остановит для ручной проверки.</p></div></div>
+      <div className="meta-import-rule"><AlertCircle size={21} /><div><strong>Выберите простой или автоматический способ получения Image Hash</strong><p>В резервном режиме заранее загрузите изображения в Meta и найдите их по именам. В новом режиме сервис сам загрузит JPG/PNG из ZIP через официальный API. Неоднозначные совпадения и ошибки будут остановлены для ручной проверки.</p></div></div>
       <div className="step-strip"><span className={csv ? "done" : "active"}><b>{csv ? <Check size={14} /> : "1"}</b> Исходный CSV</span><ArrowRight size={15} /><span className={csv ? "done" : ""}><b>{csv ? <Check size={14} /> : "2"}</b> Подготовка</span><ArrowRight size={15} /><span className={zipSourceFile ? "done" : csv ? "active" : ""}><b>{zipSourceFile ? <Check size={14} /> : "3"}</b> ZIP</span><ArrowRight size={15} /><span className={metaReady ? "done" : hasBothFiles ? "active" : ""}><b>{metaReady ? <Check size={14} /> : "4"}</b> Хэши</span><ArrowRight size={15} /><span className={metaReady ? "active" : ""}><b>5</b> Скачать</span></div>
       <div className="upload-grid">
         <UploadCard type="csv" title="Исходный экспорт Meta" subtitle="Можно загрузить оригинальный UTF-16/TAB или уже очищенный CSV" accept=".csv,.txt,text/csv,text/plain" fileName={csvSourceFile?.name} meta={csv ? `${csv.rows.length} строк · ${csv.headers.length} колонок · готовый UTF-8 CSV` : ""} busy={busy === "csv"} onFile={loadCsv} onClear={() => { setCsv(null); setCsvSourceFile(null); setColumns({ source: "", imageFile: "", videoFile: "", imageHash: "" }); setManualOverrides({}); setCleanupReport(null); setSourceFormat(""); setRenameReport(null); setRenameUndoCsv(null); setAccountId(""); setAccountIdSource(""); resetMetaResults(); }} />
@@ -693,18 +878,42 @@ export default function Home() {
         {(duplicateNames.length > 0 || stats.unrecognizedFiles > 0 || ignoredFiles.length > 0 || csv.warnings.length > 0) && <div className="diagnostics"><div className="diagnostics-title"><CircleHelp size={17} /> Диагностика входных файлов</div>{duplicateNames.length > 0 && <p><b>Дубликаты имён:</b> {duplicateNames.slice(0, 5).join(", ")}{duplicateNames.length > 5 ? ` и ещё ${duplicateNames.length - 5}` : ""}. Переименуйте файлы, чтобы имена были уникальными.</p>}{stats.unrecognizedFiles > 0 && <p><b>Не распознан язык:</b> у {stats.unrecognizedFiles} креативов. Они не будут назначены автоматически.</p>}{ignoredFiles.length > 0 && <p><b>Игнорируются:</b> {ignoredFiles.length} неподдерживаемых файлов внутри ZIP.</p>}{csv.warnings.length > 0 && <p><b>CSV:</b> {csv.warnings[0]}</p>}</div>}
 
         <section className="api-panel">
-          <div className="api-panel-head"><div><div className="section-kicker">Официальный Meta Graph API</div><h2>{metaMode === "find" ? "Найти загруженные креативы" : "Загрузить креативы в Meta"}</h2><p>{metaMode === "find" ? "Сервис получит список изображений из выбранного кабинета и сопоставит их с файлами из ZIP." : "Сервис последовательно загрузит используемые JPG/PNG из ZIP в выбранный кабинет, получит Image Hash и подготовит CSV."}</p></div><div className="memory-badge"><LockKeyhole size={15} /><span><b>Сохранён только для вкладки</b>Передаётся напрямую в Meta Graph API и исчезнет после закрытия вкладки</span></div></div>
+          <div className="api-environment-reminder"><Server size={17} /><span><b>Перед работой с API проверьте окружение:</b> нужный профиль AdsPower, закреплённый IP/прокси и рекламный кабинет того King, с которого выполняется залив.</span></div>
+          <div className="api-panel-head"><div><div className="section-kicker">Официальный Meta Graph API</div><h2>{metaMode === "find" ? "Найти загруженные креативы" : "Загрузить креативы в Meta"}</h2><p>{metaMode === "find" ? "Сервис получит список изображений из выбранного кабинета и сопоставит их с файлами из ZIP." : "Сервис загрузит используемые JPG/PNG из ZIP ограниченной параллельной очередью, получит Image Hash из ответа Meta и подготовит CSV."}</p></div><div className="memory-badge"><LockKeyhole size={15} /><span><b>Сохранён только для вкладки</b>Передаётся напрямую в Meta Graph API и исчезнет после закрытия вкладки</span></div></div>
           <div className="api-mode-tabs" role="tablist" aria-label="Способ получения Image Hash">
             <button type="button" role="tab" aria-selected={metaMode === "find"} className={metaMode === "find" ? "active" : ""} onClick={() => { setMetaMode("find"); resetMetaResults(); setError(null); }}><Search size={16} /><span><b>Найти в Meta</b><small>Креативы уже загружены вручную</small></span></button>
             <button type="button" role="tab" aria-selected={metaMode === "upload"} className={metaMode === "upload" ? "active" : ""} onClick={() => { setMetaMode("upload"); resetMetaResults(); setError(null); }}><UploadCloud size={16} /><span><b>Загрузить в Meta</b><small>Отправить JPG/PNG прямо из ZIP</small></span></button>
           </div>
+          {metaMode === "upload" && <div className="automation-risk-note"><ShieldCheck size={16} /><span>Одновременно отправляются не более трёх файлов. Image Hash приходит в ответе Meta без дополнительного запроса. Старый режим поиска уже загруженных изображений сохранён как резервный.</span></div>}
           <div className="api-form">
-            <label className="api-field"><span><Database size={15} /> ID рекламного кабинета <HelpTip label="ID рекламного кабинета">Сервис ищет ID в конце Ad Name после последнего подчёркивания. Его можно исправить вручную; префикс act_ вводить не нужно.</HelpTip></span><input value={accountId} inputMode="numeric" autoComplete="off" placeholder="Например, 1330165429102103" onChange={(event) => { setAccountId(event.target.value.replace(/\D/g, "")); setAccountIdSource("manual"); resetMetaResults(); }} /><small>{accountIdSource === "auto" ? "Определён автоматически по окончанию неймингов в CSV" : "Можно вставить вручную без префикса act_"}</small></label>
-            <label className="api-field api-field--token"><span className="api-field-heading"><span><KeyRound size={15} /> Access token <HelpTip label="Meta Access Token">Для поиска достаточно ads_read или ads_management. Для загрузки изображений нужен ads_management и право управления выбранным кабинетом. Токен не попадает в CSV и хранится только в sessionStorage текущей вкладки.</HelpTip></span>{token && <button type="button" className="clear-token-button" onClick={clearToken} title="Удалить токен из текущей вкладки"><Trash2 size={13} /> Удалить</button>}</span><textarea value={token} autoComplete="off" spellCheck={false} placeholder={metaMode === "upload" ? "Вставьте токен с ads_management" : "Вставьте токен с ads_read или ads_management"} onChange={(event) => { setToken(event.target.value.trim()); resetMetaResults(); }} /><small>{metaMode === "upload" ? "Для загрузки нужен ads_management и доступ к кабинету" : "Передаётся напрямую на graph.facebook.com"}</small></label>
-            <label className="api-field"><span><Link2 size={15} /> Версия API <HelpTip label="Версия Meta Graph API">Используйте актуальную версию по умолчанию. Старшую сохранённую версию выбирайте только если ваше Meta-приложение ещё не поддерживает текущую.</HelpTip></span><select value={graphVersion} onChange={(event) => { setGraphVersion(event.target.value as GraphVersion); resetMetaResults(); }}><option value="v26.0">v26.0</option><option value="v25.0">v25.0</option></select><small>По умолчанию используется текущая v26.0</small></label>
+            <label className="api-field"><span><Database size={15} /> ID рекламного кабинета <HelpTip label="ID рекламного кабинета">Введите ID кабинета или вставьте целиком ссылку из Ads Manager — сервис возьмёт значение параметра act=. Значения business_id и global_scope_id не являются ID рекламного кабинета. Автоматически найденный по неймингу ID обязательно проверьте.</HelpTip></span><input value={accountId} autoComplete="off" placeholder="ID или ссылка из Ads Manager" onChange={(event) => { const extracted = extractAdAccountId(event.target.value); setAccountId(extracted); setAccountIdSource("manual"); setMetaPixels([]); setMetaPages([]); setSelectedPixelId(""); setSelectedPageId(""); resetMetaResults(); if (event.target.value.trim() && !extracted) setError("Не удалось найти ID кабинета. Вставьте числовой ID или ссылку Ads Manager с параметром act=."); else setError(null); }} /><small>{accountIdSource === "auto" ? "Определён по неймингу — обязательно сверьте с параметром act= в Ads Manager" : "Можно вставить ID или полную ссылку Ads Manager; используется только параметр act="}</small></label>
+            <label className="api-field api-field--token"><span className="api-field-heading"><span><KeyRound size={15} /> Access token <HelpTip label="Meta Access Token">Для поиска достаточно ads_read или ads_management. Для загрузки изображений нужен ads_management и право управления выбранным кабинетом. Токен не попадает в CSV и хранится только в sessionStorage текущей вкладки.</HelpTip></span>{token && <button type="button" className="clear-token-button" onClick={clearToken} title="Удалить токен из текущей вкладки"><Trash2 size={13} /> Удалить</button>}</span><textarea value={token} autoComplete="off" spellCheck={false} placeholder={metaMode === "upload" ? "Вставьте токен с ads_management" : "Вставьте токен с ads_read или ads_management"} onChange={(event) => { setToken(event.target.value.trim()); setMetaAccounts([]); setUnavailableAccountCount(0); setMetaPixels([]); setMetaPages([]); setSelectedPixelId(""); setSelectedPageId(""); resetMetaResults(); }} /><small>{metaMode === "upload" ? "Для загрузки нужен ads_management и доступ к кабинету" : "Передаётся напрямую на graph.facebook.com"}</small></label>
+            <label className="api-field"><span><Link2 size={15} /> Версия API <HelpTip label="Версия Meta Graph API">Используйте актуальную версию по умолчанию. Старшую сохранённую версию выбирайте только если ваше Meta-приложение ещё не поддерживает текущую.</HelpTip></span><select value={graphVersion} onChange={(event) => { setGraphVersion(event.target.value as GraphVersion); setMetaAccounts([]); setMetaPixels([]); setMetaPages([]); resetMetaResults(); }}><option value="v26.0">v26.0</option><option value="v25.0">v25.0</option></select><small>По умолчанию используется текущая v26.0</small></label>
             {metaMode === "find" ? <button className="start-button" type="button" disabled={blockers || !accountId || !token || Boolean(busy)} onClick={handleMetaSync}>{busy === "meta" ? <Loader2 className="spin" size={18} /> : <Search size={18} />}<span>{busy === "meta" ? "Ищем креативы…" : "Найти креативы"}</span></button>
-              : <button className="start-button start-button--upload" type="button" disabled={blockers || !accountId || !token || Boolean(busy) || imageCount === 0 || uploadComplete} onClick={() => handleMetaUpload(uploadStats.failed > 0)}>{busy === "meta-upload" ? <Loader2 className="spin" size={18} /> : uploadComplete ? <Check size={18} /> : uploadStats.failed > 0 ? <RotateCcw size={18} /> : <UploadCloud size={18} />}<span>{busy === "meta-upload" ? `Загрузка ${uploadStats.uploaded + uploadStats.failed + uploadStats.active}/${uploadStats.total}` : uploadComplete ? "Все загружено" : uploadStats.failed > 0 ? `Повторить ошибки (${uploadStats.failed})` : `Загрузить изображения (${imageCount})`}</span></button>}
+              : <button className="start-button start-button--upload" type="button" disabled={blockers || !accountId || !token || Boolean(busy) || imageCount === 0 || uploadComplete} onClick={() => handleMetaUpload(uploadStats.failed > 0)}>{busy === "meta-upload" ? <Loader2 className="spin" size={18} /> : uploadComplete ? <Check size={18} /> : uploadStats.failed > 0 ? <RotateCcw size={18} /> : <UploadCloud size={18} />}<span>{busy === "meta-upload" ? (uploadStats.active ? `Загрузка ${uploadStats.uploaded + uploadStats.failed + uploadStats.active}/${uploadStats.total}` : "Проверяем доступ к кабинету…") : uploadComplete ? "Все загружено" : uploadStats.failed > 0 ? `Повторить ошибки (${uploadStats.failed})` : `Загрузить изображения (${imageCount})`}</span></button>}
           </div>
+          <section className="resource-lab">
+            <div className="resource-lab-head"><div><span className="feature-chip">Настройки</span><h3>Ресурсы кабинета и настройки CSV</h3><p>Можно оставить ручной ID как раньше или получить доступные ресурсы через токен. Активные кабинеты отмечены зелёным, заблокированные и недоступные — красным.</p></div><button type="button" className="resource-action" disabled={!token || Boolean(resourceBusy) || Boolean(busy)} onClick={handleDiscoverAccounts}>{resourceBusy === "accounts" ? <Loader2 className="spin" size={15} /> : <Database size={15} />}{resourceBusy === "accounts" ? "Получаем кабинеты…" : "Показать мои кабинеты"}</button></div>
+
+            {metaAccounts.length > 0 && <div className="account-browser">
+              <div className="account-browser-toolbar"><label><Search size={14} /><input value={accountSearch} onChange={(event) => setAccountSearch(event.target.value)} placeholder="Поиск по названию или ID" /></label><span>Всего: {metaAccounts.length}{unavailableAccountCount ? ` · недоступных: ${unavailableAccountCount}` : ""}</span></div>
+              <div className="account-card-grid">{filteredAccounts.map((account) => {
+                const id = (account.account_id || account.id).replace(/^act_/i, "");
+                const isActive = isMetaAdAccountActive(account);
+                return <button type="button" key={account.id} className={[id === accountId ? "selected" : "", !isActive ? "unavailable" : ""].filter(Boolean).join(" ")} aria-disabled={!isActive} title={isActive ? "Выбрать рекламный кабинет" : "Недоступный кабинет показан только для информации"} onClick={() => { if (isActive) selectMetaAccount(account); }}><span className="account-status-dot" /><span><b>{account.name || `Кабинет ${id}`}</b><small>act_{id}</small><em>{isActive ? ([account.currency, account.timezone_name].filter(Boolean).join(" · ") || "Активен") : metaAdAccountStatusLabel(account)}</em></span>{id === accountId && <CheckCircle2 size={17} />}</button>;
+              })}</div>
+            </div>}
+
+            <div className="selected-resource-row"><div><Database size={17} /><span><b>{selectedAccount?.name || (accountId ? `Кабинет act_${accountId}` : "Кабинет не выбран")}</b><small>{selectedAccount ? `${selectedAccount.currency || "Валюта не указана"} · ${selectedAccount.timezone_name || "Часовой пояс не указан"}` : "Можно указать ID вручную в поле выше"}</small></span></div><button type="button" className="resource-action resource-action--secondary" disabled={!accountId || !token || Boolean(resourceBusy) || Boolean(busy)} onClick={handleLoadAccountAssets}>{resourceBusy === "assets" ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />}{resourceBusy === "assets" ? "Получаем ресурсы…" : "Загрузить пиксели и страницы"}</button></div>
+
+            <div className="campaign-editor-grid">
+              <label className="campaign-editor-field"><span>Страны <HelpTip label="Countries">Двухбуквенные ISO-коды через запятую. Настройка будет применена ко всем строкам CSV в колонке Countries.</HelpTip></span><textarea value={countriesInput} onChange={(event) => setCountriesInput(event.target.value)} placeholder="IT, ES, DE" /><small>Добавляйте и удаляйте коды через запятую</small></label>
+              <label className="campaign-editor-field"><span>Языки аудитории <HelpTip label="Locales">Значения колонки Locales через запятую, например Italian или English. Пустое поле очистит языковое ограничение.</HelpTip></span><textarea value={localesInput} onChange={(event) => setLocalesInput(event.target.value)} placeholder="Italian, English" /><small>Это таргетинг Locales, а не язык названия креатива</small></label>
+              <label className="campaign-editor-field"><span>Пиксель кабинета</span><select value={selectedPixelId} onChange={(event) => setSelectedPixelId(event.target.value)}><option value="">Не изменять пиксель</option>{metaPixels.map((pixel) => <option key={pixel.id} value={pixel.id}>{pixel.name || "Без названия"} · {pixel.id}</option>)}</select><small>{metaPixels.length ? `Доступно пикселей: ${metaPixels.length}` : "Сначала загрузите ресурсы выбранного кабинета"}</small></label>
+              <div className="campaign-editor-field page-picker-field"><span>Facebook Page</span>{metaPages.length ? <div className="page-picker-grid">{metaPages.map((page) => <button type="button" key={page.id} className={selectedPageId === page.id ? "selected" : ""} onClick={() => setSelectedPageId(page.id)}><span className="page-avatar" style={page.picture?.data?.url ? { backgroundImage: `url(${page.picture.data.url})` } : undefined}>{!page.picture?.data?.url && (page.name?.slice(0, 1).toLocaleUpperCase() || "P")}</span><span><b>{page.name || "Страница без названия"}</b><small>{page.id}</small></span>{selectedPageId === page.id && <Check size={14} />}</button>)}</div> : <div className="empty-resource">Страницы не получены. Назначьте Page системному пользователю и проверьте права business_management; затем загрузите ресурсы повторно.</div>}</div>
+            </div>
+            <div className="campaign-editor-actions"><div>{campaignUpdateReport && <span className="campaign-update-result"><CheckCircle2 size={15} /> Изменено ячеек: {campaignUpdateReport.changedCells} · строк: {campaignUpdateReport.changedRows}{campaignUpdateReport.missingColumns.length ? ` · отсутствуют колонки: ${campaignUpdateReport.missingColumns.join(", ")}` : ""}</span>}</div>{campaignUndoCsv && <button type="button" className="undo-rename" onClick={undoCampaignSettings}><RotateCcw size={14} /> Отменить настройки</button>}<button type="button" className="resource-apply" onClick={handleApplyCampaignSettings}><Check size={15} /> Применить к CSV</button></div>
+          </section>
           {videoCount > 0 && <div className="notice notice--error"><AlertCircle size={18} /><span>В текущем режиме поддерживаются только изображения. Для {videoCount} видео нужен отдельный запрос AdVideo и отдельная колонка Video ID.</span></div>}
           {metaMode === "upload" && uploadResults.length > 0 && <div className="upload-progress-card">
             <div><span><b>{busy === "meta-upload" ? "Загружаем изображения" : uploadStats.failed ? "Загрузка завершена с ошибками" : "Все изображения загружены"}</b><small>{uploadStats.uploaded} успешно · {uploadStats.failed} ошибок · всего {uploadStats.total}</small></span><strong>{uploadStats.total ? Math.round(((uploadStats.uploaded + uploadStats.failed) / uploadStats.total) * 100) : 0}%</strong></div>
@@ -745,6 +954,6 @@ export default function Home() {
     </section>
 
     <section className="how-it-works"><div><span>01</span><strong>Загрузите экспорт Meta</strong><p>Поддерживается оригинальный UTF-16/TAB без ручной конвертации.</p></div><div><span>02</span><strong>Обновите нейминги</strong><p>Очистка выполнится автоматически, а массовая замена работает как Ctrl+H.</p></div><div><span>03</span><strong>Получите хэши</strong><p>Найдите готовые изображения в Meta или загрузите JPG/PNG прямо из ZIP.</p></div><div><span>04</span><strong>Скачайте CSV</strong><p>Готовый файл можно сразу импортировать в Ads Manager.</p></div></section>
-    <footer><span>Creative Extractor · v1.6.0</span><span>Файлы обрабатываются локально. Токен хранится только до закрытия текущей вкладки.</span></footer>
+    <footer><span>Creative Extractor · v1.8.0</span><span>Файлы обрабатываются локально. Токен хранится только до закрытия текущей вкладки.</span></footer>
   </main>;
 }

@@ -49,6 +49,72 @@ type GraphImageUploadResponse = {
   error?: { message?: string; type?: string; code?: number; error_subcode?: number };
 };
 
+export type MetaAdAccountAccess = {
+  id: string;
+  account_id?: string;
+  name?: string;
+  account_status?: number;
+  business?: { id?: string; name?: string };
+};
+
+export type MetaAdAccount = MetaAdAccountAccess & {
+  disable_reason?: number;
+  currency?: string;
+  timezone_name?: string;
+  business?: { id?: string; name?: string };
+};
+
+export type MetaPixel = {
+  id: string;
+  name?: string;
+  last_fired_time?: string;
+};
+
+export type MetaPage = {
+  id: string;
+  name?: string;
+  picture?: { data?: { url?: string; width?: number; height?: number; is_silhouette?: boolean } };
+};
+
+export type MetaAccountDiscovery = {
+  accounts: MetaAdAccount[];
+  unavailable: number;
+};
+
+export async function runWithConcurrency<T>(items: T[], limit: number, worker: (item: T, index: number) => Promise<void>): Promise<void> {
+  if (!items.length) return;
+  const concurrency = Math.max(1, Math.min(Math.floor(limit), items.length));
+  let cursor = 0;
+  await Promise.all(Array.from({ length: concurrency }, async () => {
+    while (cursor < items.length) {
+      const index = cursor;
+      cursor += 1;
+      await worker(items[index], index);
+    }
+  }));
+}
+
+export function isMetaAdAccountActive(account: MetaAdAccount): boolean {
+  return Number(account.account_status) === 1 && (!account.disable_reason || Number(account.disable_reason) === 0);
+}
+
+export function metaAdAccountStatusLabel(account: MetaAdAccount): string {
+  if (isMetaAdAccountActive(account)) return "Активен";
+  const status = Number(account.account_status);
+  if (status === 2) return "Отключён Meta";
+  if (status === 3) return "Есть задолженность";
+  if (status === 7) return "На проверке риска";
+  if (status === 8) return "Ожидает оплаты";
+  if (status === 9) return "Льготный период";
+  if (status === 100) return "Ожидает закрытия";
+  if (status === 101) return "Закрыт";
+  return `Недоступен · статус ${Number.isFinite(status) ? status : "неизвестен"}`;
+}
+
+type GraphAdAccountResponse = Partial<MetaAdAccountAccess> & {
+  error?: { message?: string; type?: string; code?: number; error_subcode?: number };
+};
+
 function baseName(value: string): string {
   let decoded = value;
   try { decoded = decodeURIComponent(value); } catch { /* The API usually returns an already decoded name. */ }
@@ -78,9 +144,19 @@ function comparableImageKey(value: string, stripMetaSuffix = false): string {
   return normalized.replace(/\.jpeg$/i, ".jpg");
 }
 
-function graphErrorMessage(response: GraphPage<unknown>, status: number): string {
+function graphErrorMessage(response: GraphPage<unknown>, status: number, accountId?: string): string {
   const error = response.error;
   if (!error) return `Meta API вернул HTTP ${status}.`;
+  const formattedAccount = accountId ? `act_${accountId.replace(/^act_/i, "")}` : "указанному рекламному кабинету";
+  if (error.code === 100 && error.error_subcode === 33) {
+    return `Токен не имеет доступа к рекламному кабинету ${formattedAccount} либо указан неверный ID. Проверьте ID кабинета и назначьте этот рекламный кабинет системному пользователю с правом управления. Одного разрешения ads_management в токене недостаточно.`;
+  }
+  if (error.code === 190) {
+    return "Access token недействителен или истёк. Создайте новый токен системного пользователя и повторите проверку.";
+  }
+  if (error.code === 10 || error.code === 200) {
+    return `Недостаточно разрешений для работы с ${formattedAccount}. Для прямой загрузки нужен ads_management, а системному пользователю должно быть выдано право управления этим кабинетом.`;
+  }
   const details = [error.code ? `код ${error.code}` : "", error.error_subcode ? `подкод ${error.error_subcode}` : ""].filter(Boolean).join(", ");
   return `${error.message || `Meta API вернул HTTP ${status}`}${details ? ` (${details})` : ""}`;
 }
@@ -113,6 +189,222 @@ function validateCredentials(accountId: string, token: string): string {
   if (!/^\d{8,25}$/.test(cleanAccountId)) throw new Error("Некорректный ID рекламного кабинета.");
   if (!token.trim()) throw new Error("Вставьте access token.");
   return cleanAccountId;
+}
+
+export function extractAdAccountId(value: string): string {
+  const input = value.trim();
+  if (!input) return "";
+  const actQuery = input.match(/[?&#]act=(\d{8,25})(?:[&#]|$)/i);
+  if (actQuery) return actQuery[1];
+  const actPrefix = input.match(/(?:^|[^a-z0-9])act_(\d{8,25})(?:[^\d]|$)/i);
+  if (actPrefix) return actPrefix[1];
+  return /^\d{0,25}$/.test(input) ? input : "";
+}
+
+export async function verifyAdAccountAccess({
+  accountId,
+  token,
+  version = "v26.0",
+  signal,
+  onLog,
+}: {
+  accountId: string;
+  token: string;
+  version?: GraphVersion;
+  signal?: AbortSignal;
+  onLog?: (entry: MetaApiLogEntry) => void;
+}): Promise<MetaAdAccountAccess> {
+  const cleanAccountId = validateCredentials(accountId, token);
+  const requestUrl = `https://graph.facebook.com/${version}/act_${cleanAccountId}?fields=${encodeURIComponent("id,account_id,name,account_status,business{id,name}")}`;
+  const startedAt = performance.now();
+  let response: Response;
+  try {
+    response = await fetch(requestUrl, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${token.trim()}` },
+      cache: "no-store",
+      signal,
+    });
+  } catch (reason) {
+    onLog?.({
+      page: 0, timestamp: new Date().toISOString(), durationMs: Math.round(performance.now() - startedAt),
+      request: { method: "GET", url: requestUrl },
+      response: { status: null, statusText: "NETWORK_ERROR", ok: false, body: { error: reason instanceof Error ? reason.message : String(reason) } },
+    });
+    throw reason;
+  }
+
+  const rawText = await response.text();
+  let payload: GraphAdAccountResponse;
+  try {
+    payload = JSON.parse(rawText) as GraphAdAccountResponse;
+  } catch {
+    onLog?.({
+      page: 0, timestamp: new Date().toISOString(), durationMs: Math.round(performance.now() - startedAt),
+      request: { method: "GET", url: requestUrl },
+      response: { status: response.status, statusText: response.statusText, ok: response.ok, body: { nonJsonBody: rawText } },
+    });
+    throw new Error(`Meta API вернул не-JSON ответ при проверке кабинета (HTTP ${response.status}).`);
+  }
+
+  onLog?.({
+    page: 0, timestamp: new Date().toISOString(), durationMs: Math.round(performance.now() - startedAt),
+    request: { method: "GET", url: requestUrl },
+    response: { status: response.status, statusText: response.statusText, ok: response.ok, body: redactSecrets(payload) },
+  });
+  if (!response.ok || payload.error) throw new Error(graphErrorMessage(payload, response.status, cleanAccountId));
+  if (!payload.id) throw new Error(`Meta API не подтвердил доступ к кабинету act_${cleanAccountId}.`);
+  return payload as MetaAdAccountAccess;
+}
+
+async function fetchGraphCollection<T>({
+  url,
+  token,
+  accountId,
+  signal,
+  onLog,
+}: {
+  url: string;
+  token: string;
+  accountId?: string;
+  signal?: AbortSignal;
+  onLog?: (entry: MetaApiLogEntry) => void;
+}): Promise<T[]> {
+  if (!token.trim()) throw new Error("Вставьте access token.");
+  let next: string | undefined = url;
+  const result: T[] = [];
+  const seenPages = new Set<string>();
+  let page = 0;
+  while (next) {
+    page += 1;
+    if (seenPages.has(next)) throw new Error("Meta API вернул зацикленную пагинацию.");
+    seenPages.add(next);
+    const requestUrl = withoutSecrets(next);
+    const startedAt = performance.now();
+    let response: Response;
+    try {
+      response = await fetch(requestUrl, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${token.trim()}` },
+        cache: "no-store",
+        signal,
+      });
+    } catch (reason) {
+      onLog?.({
+        page, timestamp: new Date().toISOString(), durationMs: Math.round(performance.now() - startedAt),
+        request: { method: "GET", url: requestUrl },
+        response: { status: null, statusText: "NETWORK_ERROR", ok: false, body: { error: reason instanceof Error ? reason.message : String(reason) } },
+      });
+      throw reason;
+    }
+    const rawText = await response.text();
+    let payload: GraphPage<T>;
+    try {
+      payload = JSON.parse(rawText) as GraphPage<T>;
+    } catch {
+      onLog?.({
+        page, timestamp: new Date().toISOString(), durationMs: Math.round(performance.now() - startedAt),
+        request: { method: "GET", url: requestUrl },
+        response: { status: response.status, statusText: response.statusText, ok: response.ok, body: { nonJsonBody: rawText } },
+      });
+      throw new Error(`Meta API вернул не-JSON ответ (HTTP ${response.status}).`);
+    }
+    onLog?.({
+      page, timestamp: new Date().toISOString(), durationMs: Math.round(performance.now() - startedAt),
+      request: { method: "GET", url: requestUrl },
+      response: { status: response.status, statusText: response.statusText, ok: response.ok, body: redactSecrets(payload) },
+    });
+    if (!response.ok || payload.error) throw new Error(graphErrorMessage(payload, response.status, accountId));
+    result.push(...(payload.data ?? []));
+    next = payload.paging?.next;
+  }
+  return result;
+}
+
+export async function fetchAccessibleAdAccounts({
+  token,
+  version = "v26.0",
+  signal,
+  onLog,
+}: {
+  token: string;
+  version?: GraphVersion;
+  signal?: AbortSignal;
+  onLog?: (entry: MetaApiLogEntry) => void;
+}): Promise<MetaAccountDiscovery> {
+  const fields = "id,account_id,name,account_status,disable_reason,currency,timezone_name,business{id,name}";
+  const accounts = await fetchGraphCollection<MetaAdAccount>({
+    url: `https://graph.facebook.com/${version}/me/adaccounts?fields=${encodeURIComponent(fields)}&limit=500`,
+    token, signal, onLog,
+  });
+  const sorted = accounts.sort((a, b) => {
+    const availability = Number(isMetaAdAccountActive(b)) - Number(isMetaAdAccountActive(a));
+    return availability || (a.name || a.account_id || a.id).localeCompare(b.name || b.account_id || b.id, undefined, { numeric: true });
+  });
+  return { accounts: sorted, unavailable: sorted.filter((account) => !isMetaAdAccountActive(account)).length };
+}
+
+export async function fetchAdAccountPixels({
+  accountId,
+  token,
+  version = "v26.0",
+  signal,
+  onLog,
+}: {
+  accountId: string;
+  token: string;
+  version?: GraphVersion;
+  signal?: AbortSignal;
+  onLog?: (entry: MetaApiLogEntry) => void;
+}): Promise<MetaPixel[]> {
+  const cleanAccountId = validateCredentials(accountId, token);
+  return fetchGraphCollection<MetaPixel>({
+    url: `https://graph.facebook.com/${version}/act_${cleanAccountId}/adspixels?fields=id,name,last_fired_time&limit=500`,
+    token, accountId: cleanAccountId, signal, onLog,
+  });
+}
+
+export async function fetchAdAccountPages({
+  accountId,
+  businessId,
+  token,
+  version = "v26.0",
+  signal,
+  onLog,
+}: {
+  accountId: string;
+  businessId?: string;
+  token: string;
+  version?: GraphVersion;
+  signal?: AbortSignal;
+  onLog?: (entry: MetaApiLogEntry) => void;
+}): Promise<MetaPage[]> {
+  const cleanAccountId = validateCredentials(accountId, token);
+  const fields = "id,name,picture.width(96).height(96){url,width,height,is_silhouette}";
+  const urls = [
+    `https://graph.facebook.com/${version}/act_${cleanAccountId}/promote_pages?fields=${encodeURIComponent(fields)}&limit=500`,
+    `https://graph.facebook.com/${version}/me/accounts?fields=${encodeURIComponent(fields)}&limit=500`,
+  ];
+  if (businessId && /^\d+$/.test(businessId)) {
+    urls.push(
+      `https://graph.facebook.com/${version}/${businessId}/owned_pages?fields=${encodeURIComponent(fields)}&limit=500`,
+      `https://graph.facebook.com/${version}/${businessId}/client_pages?fields=${encodeURIComponent(fields)}&limit=500`,
+    );
+  }
+  const results = await Promise.allSettled(urls.map((url) => fetchGraphCollection<MetaPage>({
+    url, token, accountId: cleanAccountId, signal, onLog,
+  })));
+  const successful = results.filter((result): result is PromiseFulfilledResult<MetaPage[]> => result.status === "fulfilled");
+  if (!successful.length) {
+    const failed = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    throw failed?.reason instanceof Error ? failed.reason : new Error("Meta API не вернул доступные Facebook Pages.");
+  }
+  const pages = new Map<string, MetaPage>();
+  successful.flatMap((result) => result.value).forEach((page) => {
+    const current = pages.get(page.id);
+    pages.set(page.id, current?.picture?.data?.url ? current : page);
+  });
+  return [...pages.values()];
 }
 
 export async function fetchAllAdImages({
@@ -178,7 +470,7 @@ export async function fetchAllAdImages({
       request: { method: "GET", url: requestUrl },
       response: { status: response.status, statusText: response.statusText, ok: response.ok, body: redactSecrets(payload) },
     });
-    if (!response.ok || payload.error) throw new Error(graphErrorMessage(payload, response.status));
+    if (!response.ok || payload.error) throw new Error(graphErrorMessage(payload, response.status, cleanAccountId));
     for (const image of payload.data ?? []) {
       if (image.hash) images.push(image);
     }
@@ -248,7 +540,7 @@ export async function uploadAdImage({
     request: { method: "POST", url: requestUrl, fileName: file.name, size: file.size },
     response: { status: response.status, statusText: response.statusText, ok: response.ok, body: redactSecrets(payload) },
   });
-  if (!response.ok || payload.error) throw new Error(graphErrorMessage(payload, response.status));
+  if (!response.ok || payload.error) throw new Error(graphErrorMessage(payload, response.status, cleanAccountId));
 
   const uploaded = Object.values(payload.images ?? {}).find((image) => Boolean(image?.hash));
   if (!uploaded) throw new Error(`Meta API не вернул Image Hash для ${file.name}.`);

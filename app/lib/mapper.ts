@@ -43,6 +43,18 @@ export type NamingReplacementReport = {
   changedRows: number;
   byColumn: Record<string, number>;
 };
+export type CampaignCsvSettings = {
+  countries?: string[];
+  locales?: string[];
+  pixelId?: string;
+  pageId?: string;
+};
+export type CampaignCsvUpdateReport = {
+  changedCells: number;
+  changedRows: number;
+  byColumn: Record<string, number>;
+  missingColumns: string[];
+};
 export type ColumnSelection = { source: string; imageFile: string; videoFile: string; imageHash: string };
 export type MappingOptions = {
   sequentialFallback: boolean;
@@ -400,6 +412,42 @@ export function replaceInNamingColumns(csv: ParsedCsv, search: string, replaceme
   });
 
   return { csv: { ...csv, rows }, report: { totalReplacements, changedCells, changedRows: changedRows.size, byColumn } };
+}
+
+export function applyCampaignCsvSettings(csv: ParsedCsv, settings: CampaignCsvSettings): { csv: ParsedCsv; report: CampaignCsvUpdateReport } {
+  const updates: Array<{ columns: string[]; value: string }> = [];
+  if (settings.countries) updates.push({ columns: ["Countries"], value: settings.countries.join(", ") });
+  if (settings.locales) updates.push({ columns: ["Locales"], value: settings.locales.join(", ") });
+  if (settings.pixelId) updates.push({ columns: ["Optimized Conversion Tracking Pixels", "Conversion Tracking Pixels"], value: `tp:${settings.pixelId.replace(/^tp:/i, "")}` });
+  if (settings.pageId) updates.push({ columns: ["Link Object ID"], value: `o:${settings.pageId.replace(/^o:/i, "")}` });
+
+  const rows = csv.rows.map((row) => [...row]);
+  const changedRows = new Set<number>();
+  const byColumn: Record<string, number> = {};
+  const missingColumns: string[] = [];
+  let changedCells = 0;
+
+  for (const update of updates) {
+    for (const column of update.columns) {
+      const index = csv.headers.indexOf(column);
+      if (index < 0) {
+        missingColumns.push(column);
+        continue;
+      }
+      rows.forEach((row, rowIndex) => {
+        if (row[index] === update.value) return;
+        row[index] = update.value;
+        changedCells += 1;
+        changedRows.add(rowIndex);
+        byColumn[column] = (byColumn[column] ?? 0) + 1;
+      });
+    }
+  }
+
+  return {
+    csv: { ...csv, rows },
+    report: { changedCells, changedRows: changedRows.size, byColumn, missingColumns: [...new Set(missingColumns)] },
+  };
 }
 
 function cell(row: string[], headers: string[], column: string): string {
