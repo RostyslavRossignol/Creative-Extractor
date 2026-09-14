@@ -17,7 +17,7 @@ import {
   type NamingScope, type ParsedCsv,
 } from "./lib/mapper";
 import {
-  fetchAllAdImages, inferAdAccountIds, matchFilesToMetaImages,
+  fetchAllAdImages, inferAdAccountIds, matchFilesToMetaImages, uploadAdImage,
   type GraphVersion, type MetaAdImage, type MetaApiLogEntry, type MetaImageMatch,
 } from "./lib/meta-api";
 
@@ -33,6 +33,15 @@ const statusLabels: Record<MappingStatus, string> = {
   existing: "Уже заполнено", skipped: "Пропущено",
 };
 type Filter = "all" | "ready" | "errors" | "manual";
+type MetaMode = "find" | "upload";
+type MetaUploadItem = {
+  fileId: string;
+  fileName: string;
+  status: "pending" | "uploading" | "uploaded" | "failed";
+  image: MetaAdImage | null;
+  error: string | null;
+  attempts: number;
+};
 const TOKEN_STORAGE_KEY = "creative-extractor:meta-access-token";
 const ASSET_BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH?.replace(/\/$/, "") ?? "";
 const GUIDE_VIDEO_SRC: string | null = `${ASSET_BASE_PATH}/creative-extractor-guide.mp4`;
@@ -251,13 +260,14 @@ export default function Home() {
   const [csvSourceFile, setCsvSourceFile] = useState<File | null>(null);
   const [zipSourceFile, setZipSourceFile] = useState<File | null>(null);
   const [creatives, setCreatives] = useState<CreativeFile[]>([]);
+  const [creativeUploadFiles, setCreativeUploadFiles] = useState<Record<string, File>>({});
   const [previewUrls, setPreviewUrls] = useState<Record<string, string>>({});
   const previewUrlListRef = useRef<string[]>([]);
   const [ignoredFiles, setIgnoredFiles] = useState<string[]>([]);
   const [columns, setColumns] = useState<ColumnSelection>({ source: "", imageFile: "", videoFile: "", imageHash: "" });
   const [options, setOptions] = useState<MappingOptions>(defaultOptions);
   const [encoding, setEncoding] = useState<EncodingMode>("auto");
-  const [busy, setBusy] = useState<"csv" | "zip" | "package" | "meta" | null>(null);
+  const [busy, setBusy] = useState<"csv" | "zip" | "package" | "meta" | "meta-upload" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState<Filter>("all");
   const [query, setQuery] = useState("");
@@ -277,8 +287,10 @@ export default function Home() {
   const [accountId, setAccountId] = useState("");
   const [accountIdSource, setAccountIdSource] = useState<"auto" | "manual" | "">("");
   const [graphVersion, setGraphVersion] = useState<GraphVersion>("v26.0");
+  const [metaMode, setMetaMode] = useState<MetaMode>("find");
   const [metaImages, setMetaImages] = useState<MetaAdImage[]>([]);
   const [metaMatches, setMetaMatches] = useState<MetaImageMatch[]>([]);
+  const [uploadResults, setUploadResults] = useState<MetaUploadItem[]>([]);
   const [metaCheckedAt, setMetaCheckedAt] = useState<Date | null>(null);
   const [apiLogs, setApiLogs] = useState<MetaApiLogEntry[]>([]);
   const [showApiLogs, setShowApiLogs] = useState(false);
@@ -342,7 +354,7 @@ export default function Home() {
       setCsv(cleaned.csv); setCsvSourceFile(file); setColumns(detected); setManualOverrides({});
       setCleanupReport(cleaned.report); setSourceFormat(`${parsed.encoding.toUpperCase()} · ${parsed.delimiter === "\t" ? "TAB" : "CSV"}`);
       setRenameFind(""); setRenameReplace(""); setRenameReport(null); setRenameUndoCsv(null);
-      setMetaImages([]); setMetaMatches([]); setMetaCheckedAt(null); setApiLogs([]); setShowApiLogs(false);
+      setMetaImages([]); setMetaMatches([]); setUploadResults([]); setMetaCheckedAt(null); setApiLogs([]); setShowApiLogs(false);
       if (inferredIds.length === 1) { setAccountId(inferredIds[0]); setAccountIdSource("auto"); }
       else { setAccountId(""); setAccountIdSource(""); }
     } catch (reason) { setError(reason instanceof Error ? reason.message : "Не удалось прочитать CSV."); }
@@ -364,6 +376,7 @@ export default function Home() {
       if (!found.length) throw new Error("В ZIP не найдены изображения JPG/PNG или видео MP4/MOV.");
       found.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
       const nextPreviewUrls: Record<string, string> = {};
+      const nextUploadFiles: Record<string, File> = {};
       const nextUrlList: string[] = [];
       await Promise.all(found.filter((creative) => creative.mediaType === "image").map(async (creative) => {
         const entry = zip.file(creative.path);
@@ -372,15 +385,18 @@ export default function Home() {
         const mimeType = creative.extension === "png" ? "image/png" : "image/jpeg";
         const safeBytes = new Uint8Array(bytes.byteLength);
         safeBytes.set(bytes);
-        const url = URL.createObjectURL(new Blob([safeBytes], { type: mimeType }));
+        const uploadFile = new File([safeBytes], creative.name, { type: mimeType });
+        const url = URL.createObjectURL(uploadFile);
+        nextUploadFiles[creative.id] = uploadFile;
         nextPreviewUrls[creative.id] = url;
         nextUrlList.push(url);
       }));
       clearPreviewUrls();
       previewUrlListRef.current = nextUrlList;
       setPreviewUrls(nextPreviewUrls);
+      setCreativeUploadFiles(nextUploadFiles);
       setCreatives(found); setIgnoredFiles(ignored); setZipSourceFile(file); setManualOverrides({});
-      setMetaImages([]); setMetaMatches([]); setMetaCheckedAt(null); setApiLogs([]); setShowApiLogs(false);
+      setMetaImages([]); setMetaMatches([]); setUploadResults([]); setMetaCheckedAt(null); setApiLogs([]); setShowApiLogs(false);
     } catch (reason) { setError(reason instanceof Error ? reason.message : "Не удалось открыть ZIP-архив."); }
     finally { setBusy(null); }
   }, [clearPreviewUrls]);
@@ -419,6 +435,13 @@ export default function Home() {
     missing: metaMatches.filter((item) => item.status === "missing").length,
     ambiguous: metaMatches.filter((item) => item.status === "ambiguous").length,
   }), [metaMatches]);
+  const uploadStats = useMemo(() => ({
+    total: uploadResults.length,
+    uploaded: uploadResults.filter((item) => item.status === "uploaded").length,
+    failed: uploadResults.filter((item) => item.status === "failed").length,
+    active: uploadResults.filter((item) => item.status === "uploading").length,
+  }), [uploadResults]);
+  const uploadComplete = Boolean(imageCount > 0 && uploadStats.total === imageCount && uploadStats.uploaded === imageCount);
   const metaReady = Boolean(hasBothFiles && (imageCount === 0 || (metaMatches.length === imageCount && metaStats.matched === imageCount && Boolean(columns.imageHash))));
   const hashByFileId = useMemo(() => Object.fromEntries(metaMatches.flatMap((match) => match.image ? [[match.fileId, `${accountId.replace(/^act_/i, "")}:${match.image.hash}`]] : [])), [metaMatches, accountId]);
   const finalBlockers = blockers || !metaReady || videoCount > 0;
@@ -451,6 +474,67 @@ export default function Home() {
     } finally { setBusy(null); }
   };
 
+  const handleMetaUpload = async (retryFailed = false) => {
+    if (!csv || blockers || !accountId.trim() || !token.trim() || busy) return;
+    const imageCreatives = usedCreatives.filter((file) => file.mediaType === "image");
+    const previous = new Map(uploadResults.map((item) => [item.fileId, item]));
+    const initial: MetaUploadItem[] = imageCreatives.map((creative) => {
+      const old = previous.get(creative.id);
+      if (retryFailed && old?.status === "uploaded") return old;
+      return {
+        fileId: creative.id,
+        fileName: creative.name,
+        status: "pending",
+        image: old?.status === "uploaded" ? old.image : null,
+        error: null,
+        attempts: old?.attempts ?? 0,
+      };
+    });
+    const targetIds = new Set(initial.filter((item) => !retryFailed || previous.get(item.fileId)?.status === "failed").map((item) => item.fileId));
+    if (!targetIds.size) return;
+
+    setBusy("meta-upload"); setError(null); setUploadResults(initial); setMetaCheckedAt(null); setApiLogs([]); setShowApiLogs(true); setLogCopied(false);
+    const current = [...initial];
+    const publish = () => {
+      setUploadResults([...current]);
+      const matches: MetaImageMatch[] = current.map((item) => item.status === "uploaded" && item.image
+        ? { fileId: item.fileId, fileName: item.fileName, status: "matched", image: item.image, candidates: [item.image], reason: "Загружено через Meta API" }
+        : { fileId: item.fileId, fileName: item.fileName, status: "missing", image: null, candidates: [], reason: item.error || (item.status === "uploading" ? "Загрузка…" : "Ожидает загрузки") });
+      setMetaMatches(matches);
+      setMetaImages(current.flatMap((item) => item.image ? [item.image] : []));
+    };
+
+    for (let index = 0; index < current.length; index += 1) {
+      const item = current[index];
+      if (!targetIds.has(item.fileId)) continue;
+      const file = creativeUploadFiles[item.fileId];
+      item.attempts += 1;
+      if (!file) {
+        item.status = "failed";
+        item.error = "Не удалось прочитать изображение из ZIP. Загрузите архив повторно.";
+        publish();
+        continue;
+      }
+      item.status = "uploading"; item.error = null; publish();
+      try {
+        item.image = await uploadAdImage({
+          accountId, token, file, version: graphVersion, requestNumber: index + 1,
+          onLog: (entry) => setApiLogs((entries) => [...entries, entry]),
+        });
+        item.status = "uploaded";
+      } catch (reason) {
+        item.status = "failed";
+        item.image = null;
+        item.error = reason instanceof Error ? reason.message : "Не удалось загрузить изображение в Meta.";
+      }
+      publish();
+    }
+    setMetaCheckedAt(new Date());
+    const failed = current.filter((item) => item.status === "failed").length;
+    if (failed) setError(`Не удалось загрузить ${failed} из ${current.length} изображений. Исправьте причину и нажмите «Повторить ошибки».`);
+    setBusy(null);
+  };
+
   const handleDownloadCsv = () => {
     if (!csv || finalBlockers) return;
     downloadText(serializeCsv(csv, createOutputRows(csv, mappings, columns, options, hashByFileId)), outputFileName(csv.fileName));
@@ -463,7 +547,7 @@ export default function Home() {
     } catch { setError("Браузер не разрешил скопировать лог. Используйте кнопку скачивания JSON."); }
   };
   const resetMetaResults = () => {
-    setMetaImages([]); setMetaMatches([]); setMetaCheckedAt(null); setApiLogs([]); setShowApiLogs(false); setLogCopied(false);
+    setMetaImages([]); setMetaMatches([]); setUploadResults([]); setMetaCheckedAt(null); setApiLogs([]); setShowApiLogs(false); setLogCopied(false);
   };
   const updateAccountFromCsv = (nextCsv: ParsedCsv) => {
     const detected = detectColumns(nextCsv.headers);
@@ -491,7 +575,7 @@ export default function Home() {
   };
   const reset = () => {
     clearPreviewUrls();
-    setCsv(null); setCsvSourceFile(null); setZipSourceFile(null); setCreatives([]); setIgnoredFiles([]);
+    setCsv(null); setCsvSourceFile(null); setZipSourceFile(null); setCreatives([]); setCreativeUploadFiles({}); setIgnoredFiles([]);
     setColumns({ source: "", imageFile: "", videoFile: "", imageHash: "" }); setOptions(defaultOptions);
     setManualOverrides({}); setError(null); setFilter("all"); setQuery(""); setAccountId("");
     setCleanupReport(null); setSourceFormat(""); setRenameFind(""); setRenameReplace(""); setRenameScopes(defaultNamingScopes); setRenameReport(null); setRenameUndoCsv(null);
@@ -515,8 +599,8 @@ export default function Home() {
         <ol className="instructions-steps">
           <li><b>1</b><div><strong>Загрузите креативы в Meta</strong><span>Сначала добавьте нужные JPG/PNG в медиатеку правильного рекламного кабинета, сохранив исходные названия файлов.</span></div></li>
           <li><b>2</b><div><strong>Добавьте CSV и ZIP</strong><span>Загрузите оригинальный экспорт кампании из Meta и ZIP с теми же креативами. Очистка технических полей выполнится автоматически.</span></div></li>
-          <li><b>3</b><div><strong>Проверьте нейминги</strong><span>При необходимости массово замените дату, модель или ID. Затем проверьте автоматическое распределение по языкам и вариантам.</span></div></li>
-          <li><b>4</b><div><strong>Получите Image Hash</strong><span>Проверьте ID кабинета, вставьте токен с ads_read или ads_management и нажмите «Start — получить хеши».</span></div></li>
+          <li><b>3</b><div><strong>Проверьте нейминги</strong><span>Название языка или ваш собственный языковой маркер должны одинаково присутствовать в объявлении и имени креатива. Регистр не важен: Catalan и catalan считаются совпадением. Затем проверьте номера вариантов.</span></div></li>
+          <li><b>4</b><div><strong>Получите Image Hash</strong><span>Выберите режим: найдите уже загруженные изображения или загрузите JPG/PNG из ZIP прямо в Meta. Для загрузки нужен токен с ads_management.</span></div></li>
           <li><b>5</b><div><strong>Устраните конфликты</strong><span>Если строка не сопоставилась однозначно, найдите и выберите правильный креатив вручную. Перед скачиванием все строки должны быть готовы.</span></div></li>
           <li><b>6</b><div><strong>Скачайте и импортируйте CSV</strong><span>Скачайте готовый файл, импортируйте его в Ads Manager и обязательно проверьте черновик перед публикацией.</span></div></li>
         </ol>
@@ -554,7 +638,7 @@ export default function Home() {
       <div className="step-strip"><span className={csv ? "done" : "active"}><b>{csv ? <Check size={14} /> : "1"}</b> Исходный CSV</span><ArrowRight size={15} /><span className={csv ? "done" : ""}><b>{csv ? <Check size={14} /> : "2"}</b> Подготовка</span><ArrowRight size={15} /><span className={zipSourceFile ? "done" : csv ? "active" : ""}><b>{zipSourceFile ? <Check size={14} /> : "3"}</b> ZIP</span><ArrowRight size={15} /><span className={metaReady ? "done" : hasBothFiles ? "active" : ""}><b>{metaReady ? <Check size={14} /> : "4"}</b> Хэши</span><ArrowRight size={15} /><span className={metaReady ? "active" : ""}><b>5</b> Скачать</span></div>
       <div className="upload-grid">
         <UploadCard type="csv" title="Исходный экспорт Meta" subtitle="Можно загрузить оригинальный UTF-16/TAB или уже очищенный CSV" accept=".csv,.txt,text/csv,text/plain" fileName={csvSourceFile?.name} meta={csv ? `${csv.rows.length} строк · ${csv.headers.length} колонок · готовый UTF-8 CSV` : ""} busy={busy === "csv"} onFile={loadCsv} onClear={() => { setCsv(null); setCsvSourceFile(null); setColumns({ source: "", imageFile: "", videoFile: "", imageHash: "" }); setManualOverrides({}); setCleanupReport(null); setSourceFormat(""); setRenameReport(null); setRenameUndoCsv(null); setAccountId(""); setAccountIdSource(""); resetMetaResults(); }} />
-        <UploadCard type="zip" title="ZIP с креативами" subtitle="Те же JPG/PNG, которые уже загружены в Meta" accept=".zip,application/zip" fileName={zipSourceFile?.name} meta={zipSourceFile ? `${creatives.length} креативов · ${formatBytes(zipSourceFile.size)}` : ""} busy={busy === "zip"} onFile={loadZip} onClear={() => { clearPreviewUrls(); setZipSourceFile(null); setCreatives([]); setIgnoredFiles([]); setManualOverrides({}); setMetaImages([]); setMetaMatches([]); setMetaCheckedAt(null); setApiLogs([]); setShowApiLogs(false); }} />
+        <UploadCard type="zip" title="ZIP с креативами" subtitle="JPG/PNG можно найти в Meta или загрузить прямо из приложения" accept=".zip,application/zip" fileName={zipSourceFile?.name} meta={zipSourceFile ? `${creatives.length} креативов · ${formatBytes(zipSourceFile.size)}` : ""} busy={busy === "zip"} onFile={loadZip} onClear={() => { clearPreviewUrls(); setZipSourceFile(null); setCreatives([]); setCreativeUploadFiles({}); setIgnoredFiles([]); setManualOverrides({}); resetMetaResults(); }} />
       </div>
       {error && <div className="notice notice--error"><AlertCircle size={18} /><span>{error}</span><button onClick={() => setError(null)} aria-label="Закрыть"><X size={16} /></button></div>}
 
@@ -589,7 +673,7 @@ export default function Home() {
         {showSettings && <div className="settings-content">
           <div className="settings-intro"><span>Проверьте автоматическое сопоставление колонок и правила записи новых креативов.</span><HelpTip label="Настройки колонок и безопасности">Автоматически выбранные значения обычно менять не нужно. Изменяйте их только если ваш CSV использует другие названия колонок или вам необходимо сохранить уже заполненные данные.</HelpTip></div>
           <div className="field-grid">
-            <SelectField label="Название объявления" help="Колонка, из которой сервис читает нейминг объявления. По ней определяются язык, номер варианта и ID рекламного кабинета. Для стандартного экспорта Meta оставьте Ad Name." value={columns.source} options={csv.headers} onChange={(source) => setColumns((value) => ({ ...value, source }))} />
+            <SelectField label="Название объявления" help="Колонка, из которой сервис читает нейминг объявления. Известные языки определяются по названиям и кодам; любой собственный языковой маркер также сработает, если одинаково написан в объявлении и имени креатива перед номером варианта. Регистр не учитывается: Catalan и catalan совпадают. Для стандартного экспорта Meta оставьте Ad Name." value={columns.source} options={csv.headers} onChange={(source) => setColumns((value) => ({ ...value, source }))} />
             <SelectField label="Image File Name" help="Колонка, куда записывается точное имя JPG/PNG-файла из загруженного ZIP. Meta использует это имя при массовом импорте вместе с Image Hash." value={columns.imageFile} options={csv.headers} optional onChange={(imageFile) => setColumns((value) => ({ ...value, imageFile }))} />
             <SelectField label="Video File Name" help="Колонка для имени видеофайла. В текущем режиме автоматическое получение хэшей работает для изображений; видео потребует отдельной API-логики." value={columns.videoFile} options={csv.headers} optional onChange={(videoFile) => setColumns((value) => ({ ...value, videoFile }))} />
             <SelectField label="Image Hash" help="Колонка, куда записывается идентификатор изображения из медиатеки выбранного рекламного кабинета. Сервис получает его через официальный Meta Graph API." value={columns.imageHash} options={csv.headers} optional onChange={(imageHash) => setColumns((value) => ({ ...value, imageHash }))} />
@@ -609,16 +693,26 @@ export default function Home() {
         {(duplicateNames.length > 0 || stats.unrecognizedFiles > 0 || ignoredFiles.length > 0 || csv.warnings.length > 0) && <div className="diagnostics"><div className="diagnostics-title"><CircleHelp size={17} /> Диагностика входных файлов</div>{duplicateNames.length > 0 && <p><b>Дубликаты имён:</b> {duplicateNames.slice(0, 5).join(", ")}{duplicateNames.length > 5 ? ` и ещё ${duplicateNames.length - 5}` : ""}. Переименуйте файлы, чтобы имена были уникальными.</p>}{stats.unrecognizedFiles > 0 && <p><b>Не распознан язык:</b> у {stats.unrecognizedFiles} креативов. Они не будут назначены автоматически.</p>}{ignoredFiles.length > 0 && <p><b>Игнорируются:</b> {ignoredFiles.length} неподдерживаемых файлов внутри ZIP.</p>}{csv.warnings.length > 0 && <p><b>CSV:</b> {csv.warnings[0]}</p>}</div>}
 
         <section className="api-panel">
-          <div className="api-panel-head"><div><div className="section-kicker">Официальный Meta Graph API</div><h2>Найти загруженные креативы</h2><p>Укажите рекламный кабинет и нажмите «Найти креативы». Сервис получит только список изображений и автоматически сопоставит их с файлами из ZIP.</p></div><div className="memory-badge"><LockKeyhole size={15} /><span><b>Сохранён только для вкладки</b>Передаётся напрямую в Meta Graph API и исчезнет после закрытия вкладки</span></div></div>
+          <div className="api-panel-head"><div><div className="section-kicker">Официальный Meta Graph API</div><h2>{metaMode === "find" ? "Найти загруженные креативы" : "Загрузить креативы в Meta"}</h2><p>{metaMode === "find" ? "Сервис получит список изображений из выбранного кабинета и сопоставит их с файлами из ZIP." : "Сервис последовательно загрузит используемые JPG/PNG из ZIP в выбранный кабинет, получит Image Hash и подготовит CSV."}</p></div><div className="memory-badge"><LockKeyhole size={15} /><span><b>Сохранён только для вкладки</b>Передаётся напрямую в Meta Graph API и исчезнет после закрытия вкладки</span></div></div>
+          <div className="api-mode-tabs" role="tablist" aria-label="Способ получения Image Hash">
+            <button type="button" role="tab" aria-selected={metaMode === "find"} className={metaMode === "find" ? "active" : ""} onClick={() => { setMetaMode("find"); resetMetaResults(); setError(null); }}><Search size={16} /><span><b>Найти в Meta</b><small>Креативы уже загружены вручную</small></span></button>
+            <button type="button" role="tab" aria-selected={metaMode === "upload"} className={metaMode === "upload" ? "active" : ""} onClick={() => { setMetaMode("upload"); resetMetaResults(); setError(null); }}><UploadCloud size={16} /><span><b>Загрузить в Meta</b><small>Отправить JPG/PNG прямо из ZIP</small></span></button>
+          </div>
           <div className="api-form">
-            <label className="api-field"><span><Database size={15} /> ID рекламного кабинета <HelpTip label="ID рекламного кабинета">Сервис ищет ID в конце Ad Name после последнего подчёркивания. Его можно исправить вручную; префикс act_ вводить не нужно.</HelpTip></span><input value={accountId} inputMode="numeric" autoComplete="off" placeholder="Например, 1330165429102103" onChange={(event) => { setAccountId(event.target.value.replace(/\D/g, "")); setAccountIdSource("manual"); setMetaImages([]); setMetaMatches([]); setMetaCheckedAt(null); setApiLogs([]); }} /><small>{accountIdSource === "auto" ? "Определён автоматически по окончанию неймингов в CSV" : "Можно вставить вручную без префикса act_"}</small></label>
-            <label className="api-field api-field--token"><span className="api-field-heading"><span><KeyRound size={15} /> Access token <HelpTip label="Meta Access Token">Нужен токен с разрешением ads_read или ads_management для выбранного кабинета. Он отправляется напрямую в Meta Graph API, не попадает в CSV и хранится только в sessionStorage текущей вкладки.</HelpTip></span>{token && <button type="button" className="clear-token-button" onClick={clearToken} title="Удалить токен из текущей вкладки"><Trash2 size={13} /> Удалить</button>}</span><textarea value={token} autoComplete="off" spellCheck={false} placeholder="Вставьте токен с ads_read или ads_management" onChange={(event) => { setToken(event.target.value.trim()); setMetaImages([]); setMetaMatches([]); setMetaCheckedAt(null); setApiLogs([]); }} /><small>Передаётся напрямую на graph.facebook.com и сохраняется только в sessionStorage этой вкладки</small></label>
-            <label className="api-field"><span><Link2 size={15} /> Версия API <HelpTip label="Версия Meta Graph API">Используйте актуальную версию по умолчанию. Старшую сохранённую версию выбирайте только если ваше Meta-приложение ещё не поддерживает текущую.</HelpTip></span><select value={graphVersion} onChange={(event) => { setGraphVersion(event.target.value as GraphVersion); setMetaImages([]); setMetaMatches([]); setMetaCheckedAt(null); setApiLogs([]); }}><option value="v26.0">v26.0</option><option value="v25.0">v25.0</option></select><small>По умолчанию используется текущая v26.0</small></label>
-            <button className="start-button" type="button" disabled={blockers || !accountId || !token || busy === "meta"} onClick={handleMetaSync}>{busy === "meta" ? <Loader2 className="spin" size={18} /> : <Play size={18} fill="currentColor" />}<span>{busy === "meta" ? "Ищем креативы…" : "Найти креативы"}</span></button>
+            <label className="api-field"><span><Database size={15} /> ID рекламного кабинета <HelpTip label="ID рекламного кабинета">Сервис ищет ID в конце Ad Name после последнего подчёркивания. Его можно исправить вручную; префикс act_ вводить не нужно.</HelpTip></span><input value={accountId} inputMode="numeric" autoComplete="off" placeholder="Например, 1330165429102103" onChange={(event) => { setAccountId(event.target.value.replace(/\D/g, "")); setAccountIdSource("manual"); resetMetaResults(); }} /><small>{accountIdSource === "auto" ? "Определён автоматически по окончанию неймингов в CSV" : "Можно вставить вручную без префикса act_"}</small></label>
+            <label className="api-field api-field--token"><span className="api-field-heading"><span><KeyRound size={15} /> Access token <HelpTip label="Meta Access Token">Для поиска достаточно ads_read или ads_management. Для загрузки изображений нужен ads_management и право управления выбранным кабинетом. Токен не попадает в CSV и хранится только в sessionStorage текущей вкладки.</HelpTip></span>{token && <button type="button" className="clear-token-button" onClick={clearToken} title="Удалить токен из текущей вкладки"><Trash2 size={13} /> Удалить</button>}</span><textarea value={token} autoComplete="off" spellCheck={false} placeholder={metaMode === "upload" ? "Вставьте токен с ads_management" : "Вставьте токен с ads_read или ads_management"} onChange={(event) => { setToken(event.target.value.trim()); resetMetaResults(); }} /><small>{metaMode === "upload" ? "Для загрузки нужен ads_management и доступ к кабинету" : "Передаётся напрямую на graph.facebook.com"}</small></label>
+            <label className="api-field"><span><Link2 size={15} /> Версия API <HelpTip label="Версия Meta Graph API">Используйте актуальную версию по умолчанию. Старшую сохранённую версию выбирайте только если ваше Meta-приложение ещё не поддерживает текущую.</HelpTip></span><select value={graphVersion} onChange={(event) => { setGraphVersion(event.target.value as GraphVersion); resetMetaResults(); }}><option value="v26.0">v26.0</option><option value="v25.0">v25.0</option></select><small>По умолчанию используется текущая v26.0</small></label>
+            {metaMode === "find" ? <button className="start-button" type="button" disabled={blockers || !accountId || !token || Boolean(busy)} onClick={handleMetaSync}>{busy === "meta" ? <Loader2 className="spin" size={18} /> : <Search size={18} />}<span>{busy === "meta" ? "Ищем креативы…" : "Найти креативы"}</span></button>
+              : <button className="start-button start-button--upload" type="button" disabled={blockers || !accountId || !token || Boolean(busy) || imageCount === 0 || uploadComplete} onClick={() => handleMetaUpload(uploadStats.failed > 0)}>{busy === "meta-upload" ? <Loader2 className="spin" size={18} /> : uploadComplete ? <Check size={18} /> : uploadStats.failed > 0 ? <RotateCcw size={18} /> : <UploadCloud size={18} />}<span>{busy === "meta-upload" ? `Загрузка ${uploadStats.uploaded + uploadStats.failed + uploadStats.active}/${uploadStats.total}` : uploadComplete ? "Все загружено" : uploadStats.failed > 0 ? `Повторить ошибки (${uploadStats.failed})` : `Загрузить изображения (${imageCount})`}</span></button>}
           </div>
           {videoCount > 0 && <div className="notice notice--error"><AlertCircle size={18} /><span>В текущем режиме поддерживаются только изображения. Для {videoCount} видео нужен отдельный запрос AdVideo и отдельная колонка Video ID.</span></div>}
-          {metaCheckedAt && <div className={`api-result-summary ${metaReady ? "is-ready" : "is-error"}`}><div>{metaReady ? <CheckCircle2 size={20} /> : <AlertCircle size={20} />}<span><b>{metaReady ? "Все изображения подтверждены" : "Сверка не пройдена"}</b>Получено из Meta: {metaImages.length} · совпало: {metaStats.matched} · не найдено: {metaStats.missing} · конфликтов: {metaStats.ambiguous}</span></div><small>Проверено {metaCheckedAt.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</small></div>}
-          {metaMatches.length > 0 && <div className="hash-table-wrap"><table className="hash-table"><thead><tr><th>Файл из ZIP</th><th>AdImage.name из Meta</th><th>Image Hash</th><th>Результат</th></tr></thead><tbody>{metaMatches.map((match) => <tr key={match.fileId} className={match.status !== "matched" ? "row--error" : ""}><td><div className="creative-cell"><ImageIcon size={15} /><span title={match.fileName}>{match.fileName}</span></div></td><td>{match.image?.name || (match.candidates.length ? `${match.candidates.length} совпадения` : "—")}</td><td><code title={match.image?.hash}>{match.image ? `${accountId}:${match.image.hash}` : "—"}</code></td><td><span className={`status status--${match.status === "matched" ? "ready" : "missing"}`}>{match.status === "matched" ? <CheckCircle2 size={14} /> : <AlertCircle size={14} />}{match.status === "matched" ? "Подтверждено" : match.status === "ambiguous" ? "Конфликт" : "Не найдено"}</span><div className="secondary-cell">{match.reason}</div></td></tr>)}</tbody></table></div>}
+          {metaMode === "upload" && uploadResults.length > 0 && <div className="upload-progress-card">
+            <div><span><b>{busy === "meta-upload" ? "Загружаем изображения" : uploadStats.failed ? "Загрузка завершена с ошибками" : "Все изображения загружены"}</b><small>{uploadStats.uploaded} успешно · {uploadStats.failed} ошибок · всего {uploadStats.total}</small></span><strong>{uploadStats.total ? Math.round(((uploadStats.uploaded + uploadStats.failed) / uploadStats.total) * 100) : 0}%</strong></div>
+            <div className="upload-progress-track"><i style={{ width: `${uploadStats.total ? ((uploadStats.uploaded + uploadStats.failed) / uploadStats.total) * 100 : 0}%` }} /></div>
+          </div>}
+          {metaCheckedAt && <div className={`api-result-summary ${metaReady ? "is-ready" : "is-error"}`}><div>{metaReady ? <CheckCircle2 size={20} /> : <AlertCircle size={20} />}<span><b>{metaReady ? (metaMode === "upload" ? "Все изображения загружены" : "Все изображения подтверждены") : (metaMode === "upload" ? "Не все изображения загружены" : "Сверка не пройдена")}</b>{metaMode === "upload" ? `Загружено: ${uploadStats.uploaded} · ошибок: ${uploadStats.failed}` : `Получено из Meta: ${metaImages.length} · совпало: ${metaStats.matched} · не найдено: ${metaStats.missing} · конфликтов: ${metaStats.ambiguous}`}</span></div><small>Проверено {metaCheckedAt.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</small></div>}
+          {metaMode === "find" && metaMatches.length > 0 && <div className="hash-table-wrap"><table className="hash-table"><thead><tr><th>Файл из ZIP</th><th>AdImage.name из Meta</th><th>Image Hash</th><th>Результат</th></tr></thead><tbody>{metaMatches.map((match) => <tr key={match.fileId} className={match.status !== "matched" ? "row--error" : ""}><td><div className="creative-cell"><ImageIcon size={15} /><span title={match.fileName}>{match.fileName}</span></div></td><td>{match.image?.name || (match.candidates.length ? `${match.candidates.length} совпадения` : "—")}</td><td><code title={match.image?.hash}>{match.image ? `${accountId}:${match.image.hash}` : "—"}</code></td><td><span className={`status status--${match.status === "matched" ? "ready" : "missing"}`}>{match.status === "matched" ? <CheckCircle2 size={14} /> : <AlertCircle size={14} />}{match.status === "matched" ? "Подтверждено" : match.status === "ambiguous" ? "Конфликт" : "Не найдено"}</span><div className="secondary-cell">{match.reason}</div></td></tr>)}</tbody></table></div>}
+          {metaMode === "upload" && uploadResults.length > 0 && <div className="hash-table-wrap"><table className="hash-table"><thead><tr><th>Файл из ZIP</th><th>Попытка</th><th>Image Hash</th><th>Результат</th></tr></thead><tbody>{uploadResults.map((item) => <tr key={item.fileId} className={item.status === "failed" ? "row--error" : ""}><td><div className="creative-cell"><ImageIcon size={15} /><span title={item.fileName}>{item.fileName}</span></div></td><td>{item.attempts || "—"}</td><td><code title={item.image?.hash}>{item.image ? `${accountId}:${item.image.hash}` : "—"}</code></td><td><span className={`status status--${item.status === "uploaded" ? "ready" : item.status === "failed" ? "missing" : "existing"}`}>{item.status === "uploading" ? <Loader2 className="spin" size={14} /> : item.status === "uploaded" ? <CheckCircle2 size={14} /> : item.status === "failed" ? <AlertCircle size={14} /> : null}{item.status === "uploading" ? "Загрузка" : item.status === "uploaded" ? "Загружено" : item.status === "failed" ? "Ошибка" : "Ожидает"}</span><div className="secondary-cell">{item.error || (item.status === "uploaded" ? "Хеш получен и будет записан в CSV" : "")}</div></td></tr>)}</tbody></table></div>}
           {apiLogs.length > 0 && <section className="api-log-panel">
             <div className="api-log-toolbar"><button className="api-log-toggle" type="button" onClick={() => setShowApiLogs((value) => !value)}><Code2 size={17} /><span><b>Лог ответов Meta API</b><small>{apiLogs.length} {apiLogs.length === 1 ? "ответ" : "ответа/ответов"} · токен удалён</small></span><ChevronDown className={showApiLogs ? "rotated" : ""} size={17} /></button><div className="api-log-actions"><button type="button" onClick={handleCopyLog}>{logCopied ? <Check size={15} /> : <Clipboard size={15} />}{logCopied ? "Скопировано" : "Копировать JSON"}</button><button type="button" onClick={() => downloadText(apiLogJson, `meta_api_log_${accountId || "unknown"}.json`, "application/json;charset=utf-8")}><Download size={15} /> Скачать JSON</button><button className="danger-action" type="button" aria-label="Очистить лог" title="Очистить лог" onClick={() => { setApiLogs([]); setShowApiLogs(false); }}><Trash2 size={15} /></button></div></div>
             {showApiLogs && <div className="api-log-body"><div className="api-log-note"><LockKeyhole size={14} /> Показан полный JSON ответа, кроме секретов: <code>access_token</code> и <code>appsecret_proof</code> автоматически удаляются.</div><pre>{apiLogJson}</pre></div>}
@@ -644,13 +738,13 @@ export default function Home() {
           </tbody></table>{filteredMappings.length > 500 && <div className="table-limit">Показаны первые 500 из {filteredMappings.length} строк. Используйте поиск и фильтры.</div>}{!filteredMappings.length && <div className="empty-table">Нет строк, соответствующих фильтру.</div>}</div>
         </section>
 
-        <div className={`download-panel ${finalBlockers ? "is-blocked" : ""}`}><div className="download-copy"><div className="download-icon">{finalBlockers ? <AlertCircle size={22} /> : <Check size={22} />}</div><div><strong>{finalBlockers ? "Готовый CSV пока заблокирован" : "CSV с подтверждёнными хешами готов"}</strong><span>{blockers ? "Сначала устраните ошибки сопоставления объявлений и файлов." : videoCount ? "Видео пока не поддерживаются этим API-режимом." : !metaReady ? "Вставьте токен, нажмите Start и добейтесь точного совпадения каждого изображения." : `В ${imageCount} строках будут заполнены Image File Name и Image Hash.`}</span></div></div><div className="download-actions"><button className="secondary-button" type="button" onClick={() => csv && downloadText("\ufeff" + createReportCsv(mappings), "creative_mapping_report.csv")}><Download size={16} /> Отчёт</button><button className="primary-button" type="button" onClick={handleDownloadCsv} disabled={finalBlockers}><FileSpreadsheet size={16} /> Скачать готовый CSV</button></div></div>
+        <div className={`download-panel ${finalBlockers ? "is-blocked" : ""}`}><div className="download-copy"><div className="download-icon">{finalBlockers ? <AlertCircle size={22} /> : <Check size={22} />}</div><div><strong>{finalBlockers ? "Готовый CSV пока заблокирован" : "CSV с подтверждёнными хешами готов"}</strong><span>{blockers ? "Сначала устраните ошибки сопоставления объявлений и файлов." : videoCount ? "Видео пока не поддерживаются этим API-режимом." : !metaReady ? (metaMode === "upload" ? "Вставьте токен с ads_management и загрузите все изображения в выбранный кабинет." : "Вставьте токен и добейтесь точного совпадения каждого изображения.") : `В ${imageCount} строках будут заполнены Image File Name и Image Hash.`}</span></div></div><div className="download-actions"><button className="secondary-button" type="button" onClick={() => csv && downloadText("\ufeff" + createReportCsv(mappings), "creative_mapping_report.csv")}><Download size={16} /> Отчёт</button><button className="primary-button" type="button" onClick={handleDownloadCsv} disabled={finalBlockers}><FileSpreadsheet size={16} /> Скачать готовый CSV</button></div></div>
         {!finalBlockers && <section className="meta-steps"><div className="section-kicker">Финальный шаг</div><h2>Импортируйте только готовый CSV</h2><div className="meta-step-grid"><div><b>1</b><span><strong>Проверьте файл</strong><small>В колонках уже стоят точные имена и хеши из выбранного кабинета.</small></span></div><div><b>2</b><span><strong>Import ads</strong><small>В Ads Manager выберите готовый CSV.</small></span></div><div><b>3</b><span><strong>Preview</strong><small>Убедитесь, что Meta показала изображения без Image Not Found.</small></span></div><div><b>4</b><span><strong>Import</strong><small>Завершите импорт кампании.</small></span></div></div><p className="meta-steps-note">Повторно добавлять ZIP в Images не требуется: CSV ссылается на изображения по хешам этого рекламного кабинета.</p></section>}
       </>}
       {(csv || zipSourceFile) && <button className="reset-button" onClick={reset}><RotateCcw size={15} /> Начать заново</button>}
     </section>
 
-    <section className="how-it-works"><div><span>01</span><strong>Загрузите экспорт Meta</strong><p>Поддерживается оригинальный UTF-16/TAB без ручной конвертации.</p></div><div><span>02</span><strong>Обновите нейминги</strong><p>Очистка выполнится автоматически, а массовая замена работает как Ctrl+H.</p></div><div><span>03</span><strong>Добавьте ZIP и хэши</strong><p>Сервис распределит языки, варианты и найдёт изображения в кабинете.</p></div><div><span>04</span><strong>Скачайте CSV</strong><p>Готовый файл можно сразу импортировать в Ads Manager.</p></div></section>
-    <footer><span>Creative Extractor · v1.5.1</span><span>Файлы обрабатываются локально. Токен хранится только до закрытия текущей вкладки.</span></footer>
+    <section className="how-it-works"><div><span>01</span><strong>Загрузите экспорт Meta</strong><p>Поддерживается оригинальный UTF-16/TAB без ручной конвертации.</p></div><div><span>02</span><strong>Обновите нейминги</strong><p>Очистка выполнится автоматически, а массовая замена работает как Ctrl+H.</p></div><div><span>03</span><strong>Получите хэши</strong><p>Найдите готовые изображения в Meta или загрузите JPG/PNG прямо из ZIP.</p></div><div><span>04</span><strong>Скачайте CSV</strong><p>Готовый файл можно сразу импортировать в Ads Manager.</p></div></section>
+    <footer><span>Creative Extractor · v1.6.0</span><span>Файлы обрабатываются локально. Токен хранится только до закрытия текущей вкладки.</span></footer>
   </main>;
 }

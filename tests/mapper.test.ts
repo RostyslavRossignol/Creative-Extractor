@@ -16,7 +16,7 @@ import {
 } from "../app/lib/mapper.ts";
 import JSZip from "jszip";
 import { createMetaImportKit, metaImportKitFileName } from "../app/lib/import-package.ts";
-import { fetchAllAdImages, inferAdAccountIds, matchFilesToMetaImages } from "../app/lib/meta-api.ts";
+import { fetchAllAdImages, inferAdAccountIds, matchFilesToMetaImages, uploadAdImage } from "../app/lib/meta-api.ts";
 
 const options: MappingOptions = {
   sequentialFallback: false,
@@ -136,6 +136,29 @@ test("recognizes Swedish regardless of case and accepts standard and common code
   assert.equal(analyzeName("creative_SE_3.jpg").languageCode, "SV");
   assert.equal(analyzeName("asset_swe_v4.jpg").languageCode, "SV");
   assert.equal(analyzeName("баннер_ШВЕДСЬКА_5.jpg").languageCode, "SV");
+});
+
+test("matches an arbitrary language marker without case sensitivity", () => {
+  const file = createCreativeFile("catalan_4_gb_uniq5TE$rVU(3n4v_428356.jpg", 100)!;
+  assert.equal(file.languageCode, "CATALAN");
+  assert.equal(file.variant, 4);
+
+  const csv: ParsedCsv = {
+    fileName: "meta.csv",
+    headers: ["Ad Name", "Image File Name", "Image Hash"],
+    rows: [["GOLD_FG_mReg_80fs[play]_Catalan_4_1422146908876280", "", ""]],
+    delimiter: ",", linebreak: "\r\n", hadBom: true, encoding: "utf-8", warnings: [],
+  };
+  const mappings = buildMappings(csv, [file], detectColumns(csv.headers), options);
+  assert.equal(mappings[0].analysis.languageCode, "CATALAN");
+  assert.equal(mappings[0].analysis.variant, 4);
+  assert.equal(mappings[0].status, "ready");
+  assert.equal(mappings[0].file?.name, file.name);
+});
+
+test("does not treat common structural words as arbitrary languages", () => {
+  assert.equal(analyzeName("creative_4.jpg").languageCode, null);
+  assert.equal(analyzeName("banner_v2.png").languageCode, null);
 });
 
 test("recognizes curated two-letter, three-letter and localized language aliases", () => {
@@ -294,6 +317,33 @@ test("reads every Meta pagination page and sends the token only in Authorization
     assert.equal(calls[0].url.includes("secret-token"), false);
     assert.equal(calls[1].url.includes("secret-token"), false);
     assert.equal(logs.length, 2);
+    assert.equal(JSON.stringify(logs).includes("secret-token"), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("uploads an image as multipart data and returns the Meta Image Hash", async () => {
+  const originalFetch = globalThis.fetch;
+  const logs: unknown[] = [];
+  let capturedUrl = "";
+  let capturedAuthorization: string | null = null;
+  let capturedBody: FormData | null = null;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    capturedUrl = String(input);
+    capturedAuthorization = new Headers(init?.headers).get("Authorization");
+    capturedBody = init?.body as FormData;
+    return new Response(JSON.stringify({ images: { "creative.jpg": { hash: "uploaded-hash", name: "creative.jpg" } } }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const file = new File([new Uint8Array([1, 2, 3])], "creative.jpg", { type: "image/jpeg" });
+    const image = await uploadAdImage({ accountId: "act_1330165429102103", token: "secret-token", file, onLog: (entry) => logs.push(entry) });
+    assert.equal(image.hash, "uploaded-hash");
+    assert.equal(capturedUrl, "https://graph.facebook.com/v26.0/act_1330165429102103/adimages");
+    assert.equal(capturedAuthorization, "Bearer secret-token");
+    const multipart = capturedBody as unknown as FormData;
+    assert.equal(multipart.get("filename") instanceof File, true);
+    assert.equal((multipart.get("filename") as File).name, "creative.jpg");
     assert.equal(JSON.stringify(logs).includes("secret-token"), false);
   } finally {
     globalThis.fetch = originalFetch;

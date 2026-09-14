@@ -254,6 +254,13 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 .memory-badge { flex: 0 0 auto; max-width: 260px; display: flex; align-items: center; gap: 9px; padding: 10px 12px; border: 1px solid #b8e3d2; border-radius: 12px; color: var(--success); background: var(--success-soft); }
 .memory-badge span { display: grid; gap: 2px; color: var(--muted); font-size: 9px; }
 .memory-badge b { color: var(--success); font-size: 11px; }
+.api-mode-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 18px; padding: 5px; border: 1px solid #dfe3f2; border-radius: 14px; background: #f1f3fa; }
+.api-mode-tabs button { min-width: 0; display: flex; align-items: center; justify-content: center; gap: 10px; padding: 11px 14px; border: 1px solid transparent; border-radius: 10px; color: #667085; background: transparent; text-align: left; cursor: pointer; transition: color .18s ease, background .18s ease, border-color .18s ease, box-shadow .18s ease; }
+.api-mode-tabs button:hover { color: var(--primary); }
+.api-mode-tabs button.active { border-color: #c7d2fe; color: var(--primary); background: #fff; box-shadow: 0 5px 14px rgba(79,70,229,.09); }
+.api-mode-tabs button > span { display: grid; gap: 2px; }
+.api-mode-tabs button b { font-size: 12px; }
+.api-mode-tabs button small { color: var(--muted); font-size: 9px; }
 .api-form { display: grid; grid-template-columns: 1fr 1.6fr .65fr auto; gap: 12px; align-items: end; margin-top: 20px; }
 .api-field { min-width: 0; display: grid; gap: 7px; }
 .api-field > span { display: flex; align-items: center; gap: 6px; color: #475467; font-size: 11px; font-weight: 850; }
@@ -266,7 +273,17 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px s
 .api-field small { min-height: 14px; color: var(--muted); font-size: 9px; line-height: 1.35; }
 .start-button { height: 41px; margin-bottom: 19px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; border: 1px solid var(--primary); border-radius: 11px; padding: 0 16px; color: white; background: var(--primary); font-size: 12px; font-weight: 900; cursor: pointer; white-space: nowrap; box-shadow: 0 8px 18px rgba(79,70,229,.18); }
 .start-button:hover { background: var(--primary-dark); }
+.start-button--upload { border-color: var(--success); background: var(--success); box-shadow: 0 8px 18px rgba(5,150,105,.18); }
+.start-button--upload:hover { background: #047857; }
 .start-button:disabled { border-color: #d0d5dd; background: #d0d5dd; box-shadow: none; cursor: not-allowed; }
+.upload-progress-card { margin-top: 16px; padding: 14px; border: 1px solid #d8deea; border-radius: 13px; background: #fff; }
+.upload-progress-card > div:first-child { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.upload-progress-card span { display: grid; gap: 3px; }
+.upload-progress-card b { font-size: 12px; }
+.upload-progress-card small { color: var(--muted); font-size: 10px; }
+.upload-progress-card strong { color: var(--success); font-size: 16px; }
+.upload-progress-track { height: 7px; margin-top: 11px; overflow: hidden; border-radius: 999px; background: #e9edf4; }
+.upload-progress-track i { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--primary), var(--success)); transition: width .25s ease; }
 .api-result-summary { margin-top: 16px; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 13px 14px; border: 1px solid; border-radius: 13px; }
 .api-result-summary > div { display: flex; align-items: center; gap: 10px; }
 .api-result-summary span { display: grid; gap: 2px; font-size: 10px; }
@@ -428,6 +445,7 @@ footer span:first-child { color: var(--ink); font-weight: 900; }
   .download-actions { display: grid; grid-template-columns: 1fr; }
   .meta-step-grid { grid-template-columns: 1fr; }
   .api-panel { padding: 17px; }
+  .api-mode-tabs { grid-template-columns: 1fr; }
   .preparation-panel { padding: 17px; }
   .rename-title { flex-direction: column; }
   .rename-form { grid-template-columns: 1fr; }

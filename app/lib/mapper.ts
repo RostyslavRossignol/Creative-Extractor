@@ -148,6 +148,30 @@ function numberFromToken(token: string | undefined): number | null {
   return number > 0 && number <= 999 ? number : null;
 }
 
+// These are structural filename words, not language markers. Unknown language
+// names are still accepted when the same marker precedes the variant number in
+// both the ad name and the creative filename.
+const GENERIC_LANGUAGE_STOPWORDS = new Set([
+  "ad", "ads", "asset", "banner", "creative", "creo", "cr", "image", "img",
+  "video", "vid", "file", "final", "new", "copy", "version", "variant", "play",
+  "promo", "campaign", "adset", "unique", "uniq",
+]);
+
+function detectGenericLanguageMarker(tokens: string[]): { code: string; label: string; variant: number; start: number } | null {
+  for (let numberIndex = 1; numberIndex < tokens.length; numberIndex += 1) {
+    const variant = numberFromToken(tokens[numberIndex]);
+    if (variant === null) continue;
+    const marker = tokens[numberIndex - 1];
+    if (!marker || GENERIC_LANGUAGE_STOPWORDS.has(marker) || !/\p{L}/u.test(marker)) continue;
+    // A marker must be a real text token. This avoids treating IDs and tiny
+    // technical fragments as arbitrary languages while still accepting codes
+    // such as CA when users employ them consistently in both names.
+    if ([...marker].length < 2) continue;
+    return { code: marker.toLocaleUpperCase(), label: marker, variant, start: numberIndex - 1 };
+  }
+  return null;
+}
+
 export function analyzeName(value: string): NameAnalysis {
   const tokens = tokenize(value.replace(/\.[^.]+$/, ""));
   const matches: Array<{ definition: LanguageDefinition; alias: string; start: number; length: number }> = [];
@@ -181,6 +205,21 @@ export function analyzeName(value: string): NameAnalysis {
   };
 }
 
+function analyzeNameForMatching(value: string): NameAnalysis {
+  const known = analyzeName(value);
+  if (known.languageCode || known.ambiguousLanguages.length) return known;
+  const tokens = tokenize(value.replace(/\.[^.]+$/, ""));
+  const generic = detectGenericLanguageMarker(tokens);
+  if (!generic) return known;
+  return {
+    languageCode: generic.code,
+    languageLabel: generic.label,
+    variant: generic.variant,
+    matchedAlias: generic.label,
+    ambiguousLanguages: [],
+  };
+}
+
 export function classifyMediaFile(name: string): MediaType | null {
   const extension = name.split(".").pop()?.toLocaleLowerCase() ?? "";
   if (IMAGE_EXTENSIONS.has(extension)) return "image";
@@ -192,7 +231,7 @@ export function createCreativeFile(path: string, size: number): CreativeFile | n
   if (!name || name.startsWith(".") || path.includes("__MACOSX")) return null;
   const mediaType = classifyMediaFile(name);
   if (!mediaType) return null;
-  return { id: path, path, name, extension: name.split(".").pop()?.toLocaleLowerCase() ?? "", mediaType, size, ...analyzeName(name) };
+  return { id: path, path, name, extension: name.split(".").pop()?.toLocaleLowerCase() ?? "", mediaType, size, ...analyzeNameForMatching(name) };
 }
 
 function normalizeHeader(value: string): string { return normalizeForTokens(value).replace(/\s+/g, ""); }
@@ -372,7 +411,7 @@ function cell(row: string[], headers: string[], column: string): string {
 export function buildMappings(csv: ParsedCsv, creatives: CreativeFile[], columns: ColumnSelection, options: MappingOptions, manualOverrides: Record<number, string> = {}): RowMapping[] {
   const mappings: RowMapping[] = csv.rows.map((row, rowIndex) => {
     const sourceName = cell(row, csv.headers, columns.source).trim();
-    const analysis = analyzeName(sourceName);
+    const analysis = analyzeNameForMatching(sourceName);
     if (!sourceName) return { rowIndex, sheetRow: rowIndex + 2, sourceName, analysis, file: null, candidates: [], status: "skipped", reason: "Пустое название объявления" };
     const manualFile = creatives.find((file) => file.id === manualOverrides[rowIndex]);
     if (manualFile) return { rowIndex, sheetRow: rowIndex + 2, sourceName, analysis, file: manualFile, candidates: [manualFile], status: "manual", reason: "Файл выбран вручную" };

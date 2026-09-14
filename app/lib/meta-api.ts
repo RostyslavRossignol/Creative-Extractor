@@ -29,7 +29,7 @@ export type MetaApiLogEntry = {
   page: number;
   timestamp: string;
   durationMs: number;
-  request: { method: "GET"; url: string };
+  request: { method: "GET" | "POST"; url: string; fileName?: string; size?: number };
   response: {
     status: number | null;
     statusText: string;
@@ -41,6 +41,11 @@ export type MetaApiLogEntry = {
 type GraphPage<T> = {
   data?: T[];
   paging?: { next?: string };
+  error?: { message?: string; type?: string; code?: number; error_subcode?: number };
+};
+
+type GraphImageUploadResponse = {
+  images?: Record<string, MetaAdImage>;
   error?: { message?: string; type?: string; code?: number; error_subcode?: number };
 };
 
@@ -103,6 +108,13 @@ function redactSecrets(value: unknown): unknown {
   return value;
 }
 
+function validateCredentials(accountId: string, token: string): string {
+  const cleanAccountId = accountId.replace(/^act_/i, "").trim();
+  if (!/^\d{8,25}$/.test(cleanAccountId)) throw new Error("Некорректный ID рекламного кабинета.");
+  if (!token.trim()) throw new Error("Вставьте access token.");
+  return cleanAccountId;
+}
+
 export async function fetchAllAdImages({
   accountId,
   token,
@@ -116,9 +128,7 @@ export async function fetchAllAdImages({
   signal?: AbortSignal;
   onLog?: (entry: MetaApiLogEntry) => void;
 }): Promise<MetaAdImage[]> {
-  const cleanAccountId = accountId.replace(/^act_/i, "").trim();
-  if (!/^\d{8,25}$/.test(cleanAccountId)) throw new Error("Некорректный ID рекламного кабинета.");
-  if (!token.trim()) throw new Error("Вставьте access token.");
+  const cleanAccountId = validateCredentials(accountId, token);
 
   const fields = [
     "id", "account_id", "name", "hash", "url", "url_128", "permalink_url",
@@ -176,6 +186,73 @@ export async function fetchAllAdImages({
   }
 
   return images;
+}
+
+export async function uploadAdImage({
+  accountId,
+  token,
+  file,
+  version = "v26.0",
+  signal,
+  onLog,
+  requestNumber = 1,
+}: {
+  accountId: string;
+  token: string;
+  file: File;
+  version?: GraphVersion;
+  signal?: AbortSignal;
+  onLog?: (entry: MetaApiLogEntry) => void;
+  requestNumber?: number;
+}): Promise<MetaAdImage> {
+  const cleanAccountId = validateCredentials(accountId, token);
+  if (!/^image\/(?:jpeg|png)$/i.test(file.type)) throw new Error(`Файл ${file.name} не является JPG или PNG.`);
+
+  const requestUrl = `https://graph.facebook.com/${version}/act_${cleanAccountId}/adimages`;
+  const form = new FormData();
+  form.append("filename", file, file.name);
+  const startedAt = performance.now();
+  let response: Response;
+  try {
+    response = await fetch(requestUrl, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token.trim()}` },
+      body: form,
+      cache: "no-store",
+      signal,
+    });
+  } catch (reason) {
+    onLog?.({
+      page: requestNumber, timestamp: new Date().toISOString(), durationMs: Math.round(performance.now() - startedAt),
+      request: { method: "POST", url: requestUrl, fileName: file.name, size: file.size },
+      response: { status: null, statusText: "NETWORK_ERROR", ok: false, body: { error: reason instanceof Error ? reason.message : String(reason) } },
+    });
+    throw reason;
+  }
+
+  const rawText = await response.text();
+  let payload: GraphImageUploadResponse;
+  try {
+    payload = JSON.parse(rawText) as GraphImageUploadResponse;
+  } catch {
+    onLog?.({
+      page: requestNumber, timestamp: new Date().toISOString(), durationMs: Math.round(performance.now() - startedAt),
+      request: { method: "POST", url: requestUrl, fileName: file.name, size: file.size },
+      response: { status: response.status, statusText: response.statusText, ok: response.ok, body: { nonJsonBody: rawText } },
+    });
+    throw new Error(`Meta API вернул не-JSON ответ при загрузке ${file.name} (HTTP ${response.status}).`);
+  }
+
+  onLog?.({
+    page: requestNumber, timestamp: new Date().toISOString(), durationMs: Math.round(performance.now() - startedAt),
+    request: { method: "POST", url: requestUrl, fileName: file.name, size: file.size },
+    response: { status: response.status, statusText: response.statusText, ok: response.ok, body: redactSecrets(payload) },
+  });
+  if (!response.ok || payload.error) throw new Error(graphErrorMessage(payload, response.status));
+
+  const uploaded = Object.values(payload.images ?? {}).find((image) => Boolean(image?.hash));
+  if (!uploaded) throw new Error(`Meta API не вернул Image Hash для ${file.name}.`);
+  return { ...uploaded, name: uploaded.name || file.name };
 }
 
 export function matchFilesToMetaImages(files: CreativeFile[], images: MetaAdImage[]): MetaImageMatch[] {
