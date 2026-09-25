@@ -299,6 +299,8 @@ export const LANGUAGE_DEFINITIONS: LanguageDefinition[] = [
   { code: "BN", label: "Бенгальский",
     aliases: ["bengali", "bangla", "বাংলা", "бенгальск*", "бенгальськ*", "=BN"],
     countries: ["bangladesh", "=BD"] },
+  { code: "RM", label: "Ретороманский",
+    aliases: ["romansh", "romansch", "rumantsch", "rumauntsch", "romanche", "ratoromanisch", "rhaeto romance", "rhaeto romanic", "ретороманск*", "ретороманськ*", "романшск*", "=RM", "=ROH"] },
   { code: "AF", label: "Африкаанс",
     aliases: ["afrikaans", "африкаанс", "afr", "=AF"] },
   { code: "SW", label: "Суахили",

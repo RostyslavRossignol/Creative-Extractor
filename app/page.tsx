@@ -206,6 +206,24 @@ function CreativeThumbnail({ file, previewUrl, compact = false }: {
   </>;
 }
 
+type UnusedCreative = { file: CreativeFile; unrecognized: boolean; reason: string };
+
+function DiagnosticFiles({ title, note, items, previewUrls }: {
+  title: string;
+  note: string;
+  items: UnusedCreative[];
+  previewUrls: Record<string, string>;
+}) {
+  return <div className="diagnostic-group">
+    <p><b>{title}: {items.length}.</b> {note}</p>
+    <div className="diagnostic-files">{items.map(({ file, reason }) => <div key={file.id} className="diagnostic-file">
+      <CreativeThumbnail file={file} previewUrl={previewUrls[file.id]} />
+      <span className="diagnostic-file-copy"><b title={file.name}>{file.name}</b><small>{reason}</small></span>
+      <code title="Язык и номер варианта, найденные в имени файла">{file.languageCode ?? "?"}:{file.variant ?? "?"}</code>
+    </div>)}</div>
+  </div>;
+}
+
 function CreativePicker({ rowNumber, creatives, file, previewUrls, selectedId, onSelect }: {
   rowNumber: number;
   creatives: CreativeFile[];
@@ -421,13 +439,26 @@ export default function Home() {
   }, [clearPreviewUrls]);
 
   const mappings = useMemo(() => !csv || !columns.source || !creatives.length ? [] : buildMappings(csv, creatives, columns, options, manualOverrides), [csv, creatives, columns, options, manualOverrides]);
+  // Creatives no ad received, with the reason shown in the diagnostics block.
+  const unusedCreatives = useMemo(() => {
+    const actionable = mappings.filter((mapping) => mapping.status !== "skipped" && mapping.status !== "existing");
+    const used = new Set(actionable.flatMap((mapping) => mapping.file ? [mapping.file.id] : []));
+    const adLanguages = new Set(actionable.flatMap((mapping) => mapping.analysis.languageCode ? [mapping.analysis.languageCode] : []));
+    return creatives.filter((file) => !used.has(file.id)).map((file): UnusedCreative => {
+      const unrecognized = !file.languageCode || file.ambiguousLanguages.length > 0;
+      const reason = file.ambiguousLanguages.length ? `В имени несколько языков: ${file.ambiguousLanguages.join(", ")}`
+        : !file.languageCode ? "Язык не распознан, общих слов с объявлениями нет"
+          : !adLanguages.has(file.languageCode) ? `В CSV нет объявлений на этом языке (${file.languageCode})`
+            : `Объявлений ${file.languageCode} меньше, чем файлов`;
+      return { file, unrecognized, reason };
+    });
+  }, [mappings, creatives]);
   const stats = useMemo(() => {
     const actionable = mappings.filter((mapping) => mapping.status !== "skipped" && mapping.status !== "existing");
     const ready = actionable.filter((mapping) => mapping.status === "ready" || mapping.status === "manual").length;
     const manual = actionable.filter((mapping) => mapping.status === "manual").length;
-    const used = new Set(actionable.flatMap((mapping) => mapping.file ? [mapping.file.id] : []));
-    return { total: actionable.length, ready, manual, errors: actionable.length - ready, unused: creatives.filter((file) => !used.has(file.id)).length, unrecognizedFiles: creatives.filter((file) => (!file.languageCode || file.ambiguousLanguages.length) && !used.has(file.id)).length };
-  }, [mappings, creatives]);
+    return { total: actionable.length, ready, manual, errors: actionable.length - ready, unused: unusedCreatives.length, unrecognizedFiles: unusedCreatives.filter((item) => item.unrecognized).length };
+  }, [mappings, unusedCreatives]);
   const duplicateNames = useMemo(() => {
     const counts = new Map<string, number>(); creatives.forEach((file) => counts.set(file.name.toLocaleLowerCase(), (counts.get(file.name.toLocaleLowerCase()) ?? 0) + 1));
     return [...counts.entries()].filter(([, count]) => count > 1).map(([name]) => name);
@@ -786,7 +817,7 @@ export default function Home() {
 
       {csv && hasBothFiles && <>
         <div className="stats-grid"><article><span>Строк объявлений</span><strong>{stats.total}</strong></article><article className="stat--success"><span>Сопоставлено</span><strong>{stats.ready}</strong></article><article className={stats.errors ? "stat--danger" : "stat--success"}><span>Требуют внимания</span><strong>{stats.errors}</strong></article><article className={stats.unused ? "stat--warn" : ""}><span>Лишних файлов</span><strong>{stats.unused}</strong></article></div>
-        {(duplicateNames.length > 0 || stats.unrecognizedFiles > 0 || ignoredFiles.length > 0 || csv.warnings.length > 0) && <div className="diagnostics"><div className="diagnostics-title"><CircleHelp size={17} /> Диагностика входных файлов</div>{duplicateNames.length > 0 && <p><b>Дубликаты имён:</b> {duplicateNames.slice(0, 5).join(", ")}{duplicateNames.length > 5 ? ` и ещё ${duplicateNames.length - 5}` : ""}. Переименуйте файлы, чтобы имена были уникальными.</p>}{stats.unrecognizedFiles > 0 && <p><b>Не распознан язык:</b> у {stats.unrecognizedFiles} креативов, и общих слов с объявлениями для них не нашлось. Они не назначены автоматически.</p>}{ignoredFiles.length > 0 && <p><b>Игнорируются:</b> {ignoredFiles.length} неподдерживаемых файлов внутри ZIP.</p>}{csv.warnings.length > 0 && <p><b>CSV:</b> {csv.warnings[0]}</p>}</div>}
+        {(duplicateNames.length > 0 || unusedCreatives.length > 0 || ignoredFiles.length > 0 || csv.warnings.length > 0) && <div className="diagnostics"><div className="diagnostics-title"><CircleHelp size={17} /> Диагностика входных файлов</div>{duplicateNames.length > 0 && <p><b>Дубликаты имён:</b> {duplicateNames.slice(0, 5).join(", ")}{duplicateNames.length > 5 ? ` и ещё ${duplicateNames.length - 5}` : ""}. Переименуйте файлы, чтобы имена были уникальными.</p>}{stats.unrecognizedFiles > 0 && <DiagnosticFiles title="Не распознан язык" note="В имени файла нет известного языка и общих слов с объявлениями, поэтому файл не назначен. Наведите на миниатюру, чтобы увеличить." items={unusedCreatives.filter((item) => item.unrecognized)} previewUrls={previewUrls} />}{stats.unused > stats.unrecognizedFiles && <DiagnosticFiles title="Лишние файлы" note="Язык распознан, но объявлений для этих креативов не хватило. В CSV они не попадут." items={unusedCreatives.filter((item) => !item.unrecognized)} previewUrls={previewUrls} />}{ignoredFiles.length > 0 && <p><b>Игнорируются:</b> {ignoredFiles.length} неподдерживаемых файлов внутри ZIP.</p>}{csv.warnings.length > 0 && <p><b>CSV:</b> {csv.warnings[0]}</p>}</div>}
 
         <section className="api-panel">
           <div className="api-environment-reminder"><Server size={17} /><span><b>Перед работой с API проверьте окружение:</b> нужный профиль AdsPower, закреплённый IP/прокси и рекламный кабинет того King, с которого выполняется залив.</span></div>

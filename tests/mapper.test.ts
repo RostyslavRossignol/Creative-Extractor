@@ -187,6 +187,7 @@ test("treats a capital code, an English name and any Russian or Ukrainian form o
   assert.equal(analyzeName("Icelandic_1").languageCode, "IS");
   assert.equal(analyzeName("Belarusian_1").languageCode, "BE");
   assert.equal(analyzeName("Irish_1").languageCode, "GA");
+  for (const name of ["romansh_uniq_428356.jpg", "Rumantsch_2", "Ретороманский_3"]) assert.equal(analyzeName(name).languageCode, "RM", name);
 });
 
 test("maps an ad and a creative that name the same language differently", () => {
