@@ -664,6 +664,56 @@ test("sequential fallback is deterministic for equal no-number groups and reject
   assert.equal(conflict[0].file, null);
 });
 
+test("assigns unnumbered creatives when a language has more files than ads", () => {
+  const ad = (language: string, variant: number) => [`Zeppelin_USA_25_09_Reg_100FS_[Multy]_${language}_${variant}_2585637576863981`, ""];
+  const csv: ParsedCsv = {
+    fileName: "meta.csv",
+    headers: ["Ad Name", "Image File Name"],
+    rows: [ad("Luxembourgish", 2), ad("Luxembourgish", 3), ad("Luxembourgish", 1), ad("Norwegian", 1), ad("Portuguese", 1), ad("Portuguese", 3), ad("Portuguese", 2)],
+    delimiter: ",", linebreak: "\n", hadBom: false, encoding: "utf-8", warnings: [],
+  };
+  const files = [
+    "Luxembourgish_uniq_479439.jpg", "Luxembourgish_uniq_977507.jpg", "Luxembourgish_uniq_120001.jpg",
+    "Norwegian_uniq_106547.jpg", "Norwegian_uniq_382435.jpg", "Norwegian_uniq_937150.jpg",
+    "Portuguese_uniq_111111.jpg", "Portuguese_uniq_222222.jpg", "Portuguese_uniq_333333.jpg",
+  ].map((name) => createCreativeFile(name, 1)!);
+  const mappings = buildMappings(csv, files, detectColumns(csv.headers), { ...options, sequentialFallback: true });
+  assert.deepEqual(mappings.map((mapping) => mapping.status), Array(7).fill("ready"));
+  assert.equal(mappings[3].analysis.languageCode, "NO");
+  assert.equal(mappings[3].file?.name, "Norwegian_uniq_106547.jpg");
+  assert.match(mappings[3].reason, /файлов больше, чем объявлений/);
+  // Groups with equal counts keep the previous sheet-order assignment.
+  assert.deepEqual(mappings.slice(0, 3).map((mapping) => mapping.file?.name), ["Luxembourgish_uniq_120001.jpg", "Luxembourgish_uniq_479439.jpg", "Luxembourgish_uniq_977507.jpg"]);
+});
+
+test("gives the same ad repeated in several ad sets the same creative", () => {
+  const csv: ParsedCsv = {
+    fileName: "meta.csv",
+    headers: ["Ad Name", "Image File Name"],
+    rows: [1, 2, 3, 1, 2, 3].map((variant) => [`Brand_Norwegian_${variant}_1010735508109581`, ""]),
+    delimiter: ",", linebreak: "\n", hadBom: false, encoding: "utf-8", warnings: [],
+  };
+  const files = ["norwegian_uniq_z.jpg", "norwegian_uniq_x.jpg", "norwegian_uniq_y.jpg"].map((name) => createCreativeFile(name, 1)!);
+  assert.deepEqual(files.map((file) => file.variant), [null, null, null]);
+  const mappings = buildMappings(csv, files, detectColumns(csv.headers), { ...options, sequentialFallback: true });
+  const names = mappings.map((mapping) => mapping.file?.name);
+  assert.deepEqual(names.slice(0, 3), ["norwegian_uniq_x.jpg", "norwegian_uniq_y.jpg", "norwegian_uniq_z.jpg"]);
+  assert.deepEqual(names.slice(3), names.slice(0, 3));
+});
+
+test("leaves ads without a creative for manual choice when files run out", () => {
+  const csv: ParsedCsv = {
+    fileName: "meta.csv",
+    headers: ["Ad Name", "Image File Name"],
+    rows: [1, 2, 3].map((variant) => [`Brand_Norwegian_${variant}_1010735508109581`, ""]),
+    delimiter: ",", linebreak: "\n", hadBom: false, encoding: "utf-8", warnings: [],
+  };
+  const files = ["norwegian_uniq_a.jpg", "norwegian_uniq_b.jpg"].map((name) => createCreativeFile(name, 1)!);
+  const mappings = buildMappings(csv, files, detectColumns(csv.headers), { ...options, sequentialFallback: true });
+  assert.deepEqual(mappings.map((mapping) => mapping.status), ["ready", "ready", "missing"]);
+  assert.notEqual(mappings[0].file?.id, mappings[1].file?.id);
+});
+
 test("builds a Meta import kit with a flat image ZIP and raw videos", async () => {
   const source = new JSZip();
   source.file("nested/Italian_GLITZ_1.jpg", new Uint8Array([1, 2, 3]));

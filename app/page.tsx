@@ -59,6 +59,20 @@ function formatBytes(bytes: number) {
   return `${(bytes / 1024 ** index).toFixed(index ? 1 : 0)} ${units[index]}`;
 }
 
+// <body> is zoomed on wide screens, and floating layers are portaled into it.
+// Depending on the browser, a fixed element in a zoomed <body> lands at
+// left × zoom or at left, so measure the real factor and convert the viewport
+// coordinates from getBoundingClientRect into the layer's own pixels.
+function toFixedLayer<T extends Record<string, number | undefined>>(position: T): T {
+  const probe = document.createElement("div");
+  probe.style.cssText = "position:fixed;left:100px;top:0;width:1px;height:1px;visibility:hidden;pointer-events:none";
+  document.body.appendChild(probe);
+  const scale = probe.getBoundingClientRect().left / 100;
+  probe.remove();
+  if (!Number.isFinite(scale) || scale <= 0 || Math.abs(scale - 1) < 0.001) return position;
+  return Object.fromEntries(Object.entries(position).map(([key, value]) => [key, value === undefined ? value : value / scale])) as T;
+}
+
 function downloadText(content: string, fileName: string, type = "text/csv;charset=utf-8") {
   downloadBlob(new Blob([content], { type }), fileName);
 }
@@ -100,7 +114,7 @@ function UploadCard({ type, title, subtitle, accept, fileName, meta, busy, onFil
 function HelpTip({ children, label }: { children: string; label: string }) {
   const id = useId();
   const buttonRef = useRef<HTMLButtonElement>(null);
-  const [position, setPosition] = useState<{ left: number; top?: number; bottom?: number; maxHeight: number } | null>(null);
+  const [position, setPosition] = useState<{ left: number; width: number; top?: number; bottom?: number; maxHeight: number } | null>(null);
   const show = useCallback(() => {
     const rect = buttonRef.current?.getBoundingClientRect();
     if (!rect) return;
@@ -108,9 +122,9 @@ function HelpTip({ children, label }: { children: string; label: string }) {
     const left = Math.min(Math.max(12, rect.left + rect.width / 2 - width / 2), window.innerWidth - width - 12);
     const roomBelow = window.innerHeight - rect.bottom;
     const roomAbove = rect.top;
-    setPosition(roomBelow >= roomAbove
-      ? { left, top: rect.bottom + 10, maxHeight: Math.max(36, roomBelow - 22) }
-      : { left, bottom: window.innerHeight - rect.top + 10, maxHeight: Math.max(36, roomAbove - 22) });
+    setPosition(toFixedLayer(roomBelow >= roomAbove
+      ? { left, width, top: rect.bottom + 10, maxHeight: Math.max(36, roomBelow - 22) }
+      : { left, width, bottom: window.innerHeight - rect.top + 10, maxHeight: Math.max(36, roomAbove - 22) }));
   }, []);
   useEffect(() => {
     if (!position) return;
@@ -158,7 +172,7 @@ function CreativeThumbnail({ file, previewUrl, compact = false }: {
       ? preferredLeft
       : Math.max(16, rect.left - size - 14);
     const top = Math.min(Math.max(16, rect.top + rect.height / 2 - boxHeight / 2), window.innerHeight - boxHeight - 16);
-    setPreviewPosition({ left, top, size });
+    setPreviewPosition(toFixedLayer({ left, top, size }));
   }, [file, previewUrl]);
   useEffect(() => {
     if (!previewPosition) return;
@@ -218,9 +232,9 @@ function CreativePicker({ rowNumber, creatives, file, previewUrls, selectedId, o
     const left = Math.min(Math.max(12, rect.left), window.innerWidth - width - 12);
     const roomBelow = window.innerHeight - rect.bottom;
     const roomAbove = rect.top;
-    setPosition(roomBelow >= 220 || roomBelow >= roomAbove
+    setPosition(toFixedLayer(roomBelow >= 220 || roomBelow >= roomAbove
       ? { left, top: rect.bottom + 7, width, maxHeight: Math.max(120, Math.min(320, roomBelow - 18)) }
-      : { left, bottom: window.innerHeight - rect.top + 7, width, maxHeight: Math.max(120, Math.min(320, roomAbove - 18)) });
+      : { left, bottom: window.innerHeight - rect.top + 7, width, maxHeight: Math.max(120, Math.min(320, roomAbove - 18)) }));
   }, []);
   const show = useCallback(() => { positionList(); setOpen(true); }, [positionList]);
   useEffect(() => {
@@ -764,7 +778,7 @@ export default function Home() {
             <label className="toggle-row"><input type="checkbox" checked={options.clearImageHash} onChange={(event) => setOptions((value) => ({ ...value, clearImageHash: event.target.checked }))} /><span><span className="toggle-heading"><b>Очищать старый Image Hash</b><HelpTip label="Очищать старый Image Hash">Удаляет хэш прежнего креатива из исходной кампании. После успешной сверки в эту же строку будет записан новый хэш изображения из выбранного кабинета.</HelpTip></span><small>Новый хеш будет записан после успешной сверки Meta</small></span></label>
             <label className="toggle-row"><input type="checkbox" checked={options.clearOtherMedia} onChange={(event) => setOptions((value) => ({ ...value, clearOtherMedia: event.target.checked }))} /><span><span className="toggle-heading"><b>Очищать противоположное медиа</b><HelpTip label="Очищать противоположное медиа">Если строке назначается изображение, сервис очищает поле видео; если назначается видео — очищает поле изображения. Это предотвращает конфликт двух типов медиа в одном объявлении.</HelpTip></span><small>Не оставлять одновременно image и video filename</small></span></label>
             <label className="toggle-row"><input type="checkbox" checked={options.overwriteExisting} onChange={(event) => setOptions((value) => ({ ...value, overwriteExisting: event.target.checked }))} /><span><span className="toggle-heading"><b>Заменять заполненные имена</b><HelpTip label="Заменять заполненные имена">Разрешает перезаписать старое значение Image File Name новым файлом из ZIP. Если выключить опцию, уже заполненные строки будут пропущены.</HelpTip></span><small>Иначе такие строки будут пропущены</small></span></label>
-            <label className="toggle-row"><input type="checkbox" checked={options.sequentialFallback} onChange={(event) => setOptions((value) => ({ ...value, sequentialFallback: event.target.checked }))} /><span><span className="toggle-heading"><b>Последовательное распределение</b><HelpTip label="Последовательное распределение">Резервный режим для неймингов без номера варианта. Он назначает файлы по порядку только когда количество строк и креативов одного языка полностью совпадает.</HelpTip></span><small>Только если числа отсутствуют и количество совпадает</small></span></label>
+            <label className="toggle-row"><input type="checkbox" checked={options.sequentialFallback} onChange={(event) => setOptions((value) => ({ ...value, sequentialFallback: event.target.checked }))} /><span><span className="toggle-heading"><b>Последовательное распределение</b><HelpTip label="Последовательное распределение">Резервный режим для креативов без номера варианта. Файлы языка раздаются по порядку, и каждое объявление получает свой креатив, даже если файлов и объявлений разное количество. Лишние файлы остаются неиспользованными; если креативов меньше, чем объявлений, оставшиеся объявления нужно выбрать вручную.</HelpTip></span><small>Для файлов без номера варианта, по одному креативу на объявление</small></span></label>
           </div>
           <label className="encoding-field"><span>Кодировка при следующей загрузке CSV <HelpTip label="Кодировка CSV">Оставьте автоматическое определение. UTF-16 LE используется в оригинальных выгрузках Meta, UTF-8 — в большинстве уже обработанных CSV, Windows-1251 — только для старых русскоязычных файлов.</HelpTip></span><select value={encoding} onChange={(event) => setEncoding(event.target.value as EncodingMode)}><option value="auto">Определить автоматически</option><option value="utf-8">UTF-8</option><option value="utf-16le">UTF-16 LE (оригинальный экспорт Meta)</option><option value="windows-1251">Windows-1251</option></select></label>
         </div>}

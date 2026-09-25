@@ -729,13 +729,14 @@ function cell(row: string[], headers: string[], column: string): string {
 type RowSlot = { mapping: RowMapping; variant: number | null; words: Set<string> };
 type FileSlot = { file: CreativeFile; variant: number | null; words: Set<string> };
 type AssignFile = (slot: RowSlot, file: CreativeFile, reason: string) => void;
-type LeftoverReasons = { forced: string; words: string; sequential: string; sequentialNoNumber: string };
+type LeftoverReasons = { forced: string; words: string; sequential: string; sequentialNoNumber: string; surplus: string };
 
 const LANGUAGE_LEFTOVER_REASONS: LeftoverReasons = {
   forced: "Однозначно назначен единственный оставшийся файл языка",
   words: "Файл языка выбран по общим словам в названиях",
   sequential: "Распределено последовательно внутри языка",
   sequentialNoNumber: "Однозначно назначен оставшийся файл языка без номера варианта",
+  surplus: "Назначен свободный файл языка без номера варианта: файлов больше, чем объявлений",
 };
 
 function variantsCompatible(a: number | null, b: number | null): boolean {
@@ -799,7 +800,13 @@ function distributeLeftovers(rows: RowSlot[], files: FileSlot[], sequentialFallb
     }
   }
 
-  if (!sequentialFallback || !openRows.length || openFiles.length !== openRows.length) return;
+  if (!sequentialFallback || !openRows.length || !openFiles.length) return;
+  if (openFiles.length === openRows.length && assignInSheetOrder(openRows, openFiles, hasTarget, reasons, assign)) return;
+  assignByAd(openRows, openFiles, hasTarget, reasons, assign);
+}
+
+// Equal numbers of rows and files: the n-th row in the sheet gets the n-th file.
+function assignInSheetOrder(openRows: RowSlot[], openFiles: FileSlot[], hasTarget: (file: CreativeFile) => boolean, reasons: LeftoverReasons, assign: AssignFile): boolean {
   const remainingFiles = [...openFiles];
   const assignments = new Map<RowSlot, FileSlot>();
   for (const slot of openRows.filter((row) => row.variant !== null)) {
@@ -809,13 +816,53 @@ function distributeLeftovers(rows: RowSlot[], files: FileSlot[], sequentialFallb
     remainingFiles.splice(remainingFiles.indexOf(compatible[0]), 1);
   }
   const remainingRows = openRows.filter((row) => !assignments.has(row)).sort((a, b) => a.mapping.sheetRow - b.mapping.sheetRow);
-  if (remainingRows.length !== remainingFiles.length) return;
-  if (!remainingRows.every((row, index) => variantsCompatible(row.variant, remainingFiles[index].variant))) return;
+  if (remainingRows.length !== remainingFiles.length) return false;
+  if (!remainingRows.every((row, index) => variantsCompatible(row.variant, remainingFiles[index].variant))) return false;
   remainingRows.forEach((row, index) => assignments.set(row, remainingFiles[index]));
   for (const slot of openRows) {
     const pick = assignments.get(slot);
     if (!pick || !hasTarget(pick.file)) continue;
     assign(slot, pick.file, slot.variant !== null && pick.variant === null ? reasons.sequentialNoNumber : reasons.sequential);
+  }
+  return true;
+}
+
+// Rows and files differ in number (one Norwegian ad and three Norwegian files,
+// or Norwegian_1..3 repeated in two ad sets). Every distinct ad takes its own
+// free file in sheet order; rows with the same variant number are one ad and
+// share a file, rows without a number each count as a separate ad. Spare files
+// stay unused, and ads left without a file stay for a manual choice.
+function assignByAd(openRows: RowSlot[], openFiles: FileSlot[], hasTarget: (file: CreativeFile) => boolean, reasons: LeftoverReasons, assign: AssignFile) {
+  const ads = new Map<string, RowSlot[]>();
+  for (const slot of [...openRows].sort((a, b) => a.mapping.sheetRow - b.mapping.sheetRow)) {
+    const key = slot.variant !== null ? `variant:${slot.variant}` : `row:${slot.mapping.rowIndex}`;
+    const slots = ads.get(key) ?? [];
+    slots.push(slot);
+    ads.set(key, slots);
+  }
+  const pool = [...openFiles];
+  const given = new Map<RowSlot[], FileSlot>();
+  for (const slots of ads.values()) {
+    if (slots[0].variant === null) continue;
+    const compatible = pool.filter((pick) => pick.variant === null || pick.variant === slots[0].variant);
+    if (compatible.length !== 1) continue;
+    given.set(slots, compatible[0]);
+    pool.splice(pool.indexOf(compatible[0]), 1);
+  }
+  for (const slots of ads.values()) {
+    if (given.has(slots)) continue;
+    const pick = pool.find((candidate) => variantsCompatible(slots[0].variant, candidate.variant));
+    if (!pick) continue;
+    given.set(slots, pick);
+    pool.splice(pool.indexOf(pick), 1);
+  }
+  for (const [slots, pick] of given) {
+    if (!hasTarget(pick.file)) continue;
+    for (const slot of slots) {
+      assign(slot, pick.file, pool.length
+        ? reasons.surplus
+        : slot.variant !== null && pick.variant === null ? reasons.sequentialNoNumber : reasons.sequential);
+    }
   }
 }
 
@@ -968,6 +1015,7 @@ function matchBySharedWords(
       words: `Файл со словом «${label}» выбран по общим словам в названиях`,
       sequential: `Распределено по порядку среди файлов со словом «${label}»`,
       sequentialNoNumber: `Назначен оставшийся файл со словом «${label}» без номера варианта`,
+      surplus: `Назначен свободный файл со словом «${label}»: файлов больше, чем объявлений`,
     }, assignByWord);
 
     // Without a known language, the shared word explains more than "Язык не
