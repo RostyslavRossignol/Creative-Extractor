@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  analyzeName, applyCampaignCsvSettings,
+  analyzeName,
   buildMappings,
   cleanMetaExport,
   createCreativeFile,
@@ -16,7 +16,7 @@ import {
 } from "../app/lib/mapper.ts";
 import JSZip from "jszip";
 import { createMetaImportKit, metaImportKitFileName } from "../app/lib/import-package.ts";
-import { extractAdAccountId, fetchAccessibleAdAccounts, fetchAdAccountPages, fetchAdAccountPixels, fetchAllAdImages, inferAdAccountIds, isMetaAdAccountActive, matchFilesToMetaImages, metaAdAccountStatusLabel, runWithConcurrency, uploadAdImage, verifyAdAccountAccess } from "../app/lib/meta-api.ts";
+import { extractAdAccountId, fetchAllAdImages, inferAdAccountIds, matchFilesToMetaImages, runWithConcurrency, uploadAdImage, verifyAdAccountAccess } from "../app/lib/meta-api.ts";
 
 const options: MappingOptions = {
   sequentialFallback: false,
@@ -57,29 +57,6 @@ test("cleans only the 15 verified technical Meta columns and normalizes the outp
   assert.equal(cleaned.report.clearedDeletedCreativeTypes, 0);
   assert.equal(cleaned.csv.delimiter, ",");
   assert.equal(cleaned.csv.encoding, "utf-8");
-});
-
-test("applies countries, locales, pixel and page only to documented CSV columns", () => {
-  const csv: ParsedCsv = {
-    fileName: "meta.csv",
-    headers: ["Ad Name", "Countries", "Locales", "Optimized Conversion Tracking Pixels", "Conversion Tracking Pixels", "Link Object ID", "Body"],
-    rows: [
-      ["Ad_1", "IT", "Italian", "", "", "", "Text 1"],
-      ["Ad_2", "IT", "Italian", "", "", "", "Text 2"],
-    ],
-    delimiter: ",", linebreak: "\r\n", hadBom: true, encoding: "utf-8", warnings: [],
-  };
-  const result = applyCampaignCsvSettings(csv, {
-    countries: ["IT", "ES"],
-    locales: ["Italian", "Spanish"],
-    pixelId: "1758732245126296",
-    pageId: "1218557241331343",
-  });
-  assert.deepEqual(result.csv.rows[0], ["Ad_1", "IT, ES", "Italian, Spanish", "tp:1758732245126296", "tp:1758732245126296", "o:1218557241331343", "Text 1"]);
-  assert.equal(result.csv.rows[1][6], "Text 2");
-  assert.equal(result.report.changedRows, 2);
-  assert.equal(result.report.changedCells, 10);
-  assert.deepEqual(result.report.missingColumns, []);
 });
 
 test("repairs POST_DELETED Creative Type from a valid sibling without changing other fields", () => {
@@ -404,53 +381,6 @@ test("checks ad account access before upload and explains an inaccessible accoun
     assert.equal(calls, 1);
     assert.equal(logs.length, 1);
     assert.equal(JSON.stringify(logs).includes("secret-token"), false);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
-});
-
-test("returns active and unavailable ad accounts with active accounts first", async () => {
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = (async () => new Response(JSON.stringify({ data: [
-    { id: "act_2", account_id: "2", name: "Active B", account_status: 1, disable_reason: 0 },
-    { id: "act_1", account_id: "1", name: "Active A", account_status: 1 },
-    { id: "act_3", account_id: "3", name: "Disabled", account_status: 2, disable_reason: 1 },
-  ] }), { status: 200 })) as typeof fetch;
-  try {
-    const result = await fetchAccessibleAdAccounts({ token: "secret-token" });
-    assert.deepEqual(result.accounts.map((account) => account.account_id), ["1", "2", "3"]);
-    assert.equal(result.unavailable, 1);
-    assert.equal(isMetaAdAccountActive(result.accounts[0]), true);
-    assert.equal(isMetaAdAccountActive(result.accounts[2]), false);
-    assert.equal(metaAdAccountStatusLabel(result.accounts[2]), "Отключён Meta");
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
-});
-
-test("loads pages from the ad account, token and business without duplicates", async () => {
-  const originalFetch = globalThis.fetch;
-  const urls: string[] = [];
-  globalThis.fetch = (async (input: string | URL | Request) => {
-    const url = String(input);
-    urls.push(url);
-    const data = url.includes("/adspixels")
-      ? [{ id: "pixel-1", name: "Main Pixel" }]
-      : [{ id: "page-1", name: "Main Page", picture: { data: { url: "https://example.com/page.jpg" } } }];
-    return new Response(JSON.stringify({ data }), { status: 200 });
-  }) as typeof fetch;
-  try {
-    const pixels = await fetchAdAccountPixels({ accountId: "123456789", token: "secret-token" });
-    const pages = await fetchAdAccountPages({ accountId: "123456789", businessId: "987654321", token: "secret-token" });
-    assert.equal(pixels[0].name, "Main Pixel");
-    assert.equal(pages[0].picture?.data?.url, "https://example.com/page.jpg");
-    assert.equal(urls.some((url) => url.includes("act_123456789/adspixels")), true);
-    assert.equal(urls.some((url) => url.includes("act_123456789/promote_pages")), true);
-    assert.equal(urls.some((url) => url.includes("/me/accounts")), true);
-    assert.equal(urls.some((url) => url.includes("987654321/owned_pages")), true);
-    assert.equal(urls.some((url) => url.includes("987654321/client_pages")), true);
-    assert.equal(pages.length, 1);
-    assert.equal(urls.some((url) => url.includes("secret-token")), false);
   } finally {
     globalThis.fetch = originalFetch;
   }

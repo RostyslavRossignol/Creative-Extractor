@@ -6,20 +6,20 @@ import JSZip from "jszip";
 import {
   AlertCircle, ArrowRight, Check, CheckCircle2, ChevronDown, CircleHelp,
   BookOpen, Clipboard, Code2, Database, Download, FileArchive, FileSpreadsheet,
-  Image as ImageIcon, KeyRound, Link2, Loader2, LockKeyhole, RefreshCw, RotateCcw,
+  Image as ImageIcon, KeyRound, Link2, Loader2, LockKeyhole, RotateCcw,
   Search, Server, Settings2, ShieldCheck, Sparkles, Trash2, UploadCloud, Video, X,
 } from "lucide-react";
 import {
-  applyCampaignCsvSettings, buildMappings, cleanMetaExport, createCreativeFile, createOutputRows, createReportCsv,
+  buildMappings, cleanMetaExport, createCreativeFile, createOutputRows, createReportCsv,
   detectColumns, NAMING_COLUMNS, outputFileName, parseCsvFile, replaceInNamingColumns, serializeCsv,
-  type CampaignCsvUpdateReport, type CleanupReport, type ColumnSelection, type CreativeFile, type EncodingMode,
+  type CleanupReport, type ColumnSelection, type CreativeFile, type EncodingMode,
   type MappingOptions, type MappingStatus, type NamingReplacementReport,
   type NamingScope, type ParsedCsv,
 } from "./lib/mapper";
 import {
-  extractAdAccountId, fetchAccessibleAdAccounts, fetchAdAccountPages, fetchAdAccountPixels, fetchAllAdImages,
-  inferAdAccountIds, isMetaAdAccountActive, matchFilesToMetaImages, metaAdAccountStatusLabel, runWithConcurrency, uploadAdImage, verifyAdAccountAccess,
-  type GraphVersion, type MetaAdAccount, type MetaAdImage, type MetaApiLogEntry, type MetaImageMatch, type MetaPage, type MetaPixel,
+  extractAdAccountId, fetchAllAdImages,
+  inferAdAccountIds, matchFilesToMetaImages, runWithConcurrency, uploadAdImage, verifyAdAccountAccess,
+  type GraphVersion, type MetaAdImage, type MetaApiLogEntry, type MetaImageMatch,
 } from "./lib/meta-api";
 
 const defaultOptions: MappingOptions = {
@@ -59,17 +59,6 @@ function formatBytes(bytes: number) {
   return `${(bytes / 1024 ** index).toFixed(index ? 1 : 0)} ${units[index]}`;
 }
 
-function csvListValue(csv: ParsedCsv, column: string): string {
-  const index = csv.headers.indexOf(column);
-  if (index < 0) return "";
-  const tokens = new Set<string>();
-  csv.rows.forEach((row) => String(row[index] ?? "").split(/[,;]+/).map((item) => item.trim()).filter(Boolean).forEach((item) => tokens.add(item)));
-  return [...tokens].join(", ");
-}
-
-function splitListValue(value: string): string[] {
-  return [...new Set(value.split(/[,;\n]+/).map((item) => item.trim()).filter(Boolean))];
-}
 function downloadText(content: string, fileName: string, type = "text/csv;charset=utf-8") {
   downloadBlob(new Blob([content], { type }), fileName);
 }
@@ -311,18 +300,6 @@ export default function Home() {
   const [apiLogs, setApiLogs] = useState<MetaApiLogEntry[]>([]);
   const [showApiLogs, setShowApiLogs] = useState(false);
   const [logCopied, setLogCopied] = useState(false);
-  const [resourceBusy, setResourceBusy] = useState<"accounts" | "assets" | null>(null);
-  const [metaAccounts, setMetaAccounts] = useState<MetaAdAccount[]>([]);
-  const [unavailableAccountCount, setUnavailableAccountCount] = useState(0);
-  const [accountSearch, setAccountSearch] = useState("");
-  const [metaPixels, setMetaPixels] = useState<MetaPixel[]>([]);
-  const [metaPages, setMetaPages] = useState<MetaPage[]>([]);
-  const [selectedPixelId, setSelectedPixelId] = useState("");
-  const [selectedPageId, setSelectedPageId] = useState("");
-  const [countriesInput, setCountriesInput] = useState("");
-  const [localesInput, setLocalesInput] = useState("");
-  const [campaignUpdateReport, setCampaignUpdateReport] = useState<CampaignCsvUpdateReport | null>(null);
-  const [campaignUndoCsv, setCampaignUndoCsv] = useState<ParsedCsv | null>(null);
 
   const clearPreviewUrls = useCallback(() => {
     previewUrlListRef.current.forEach((url) => URL.revokeObjectURL(url));
@@ -382,9 +359,6 @@ export default function Home() {
       setCsv(cleaned.csv); setCsvSourceFile(file); setColumns(detected); setManualOverrides({});
       setCleanupReport(cleaned.report); setSourceFormat(`${parsed.encoding.toUpperCase()} · ${parsed.delimiter === "\t" ? "TAB" : "CSV"}`);
       setRenameFind(""); setRenameReplace(""); setRenameReport(null); setRenameUndoCsv(null);
-      setCountriesInput(csvListValue(cleaned.csv, "Countries")); setLocalesInput(csvListValue(cleaned.csv, "Locales"));
-      setSelectedPixelId(""); setSelectedPageId(""); setCampaignUpdateReport(null); setCampaignUndoCsv(null);
-      setMetaAccounts([]); setUnavailableAccountCount(0); setAccountSearch(""); setMetaPixels([]); setMetaPages([]);
       setMetaImages([]); setMetaMatches([]); setUploadResults([]); setMetaCheckedAt(null); setApiLogs([]); setShowApiLogs(false);
       if (inferredIds.length === 1) { setAccountId(inferredIds[0]); setAccountIdSource("auto"); }
       else { setAccountId(""); setAccountIdSource(""); }
@@ -490,71 +464,6 @@ export default function Home() {
       return { scope, header, count: values.length, values };
     });
   }, [csv]);
-  const filteredAccounts = useMemo(() => {
-    const needle = accountSearch.trim().toLocaleLowerCase();
-    if (!needle) return metaAccounts;
-    return metaAccounts.filter((account) => `${account.name ?? ""} ${account.account_id ?? account.id} ${account.business?.name ?? ""}`.toLocaleLowerCase().includes(needle));
-  }, [metaAccounts, accountSearch]);
-  const selectedAccount = useMemo(() => metaAccounts.find((account) => (account.account_id || account.id).replace(/^act_/i, "") === accountId) ?? null, [metaAccounts, accountId]);
-
-  const handleDiscoverAccounts = async () => {
-    if (!token.trim() || resourceBusy) return;
-    setResourceBusy("accounts"); setError(null); setApiLogs([]); setShowApiLogs(true); setLogCopied(false);
-    try {
-      const discovery = await fetchAccessibleAdAccounts({ token, version: graphVersion, onLog: (entry) => setApiLogs((current) => [...current, entry]) });
-      setMetaAccounts(discovery.accounts); setUnavailableAccountCount(discovery.unavailable);
-      if (!discovery.accounts.length) setError("Токен не вернул ни одного рекламного кабинета. Проверьте назначенные системному пользователю ресурсы.");
-    } catch (reason) {
-      setMetaAccounts([]); setUnavailableAccountCount(0);
-      setError(reason instanceof Error ? reason.message : "Не удалось получить рекламные кабинеты.");
-    } finally { setResourceBusy(null); }
-  };
-
-  const selectMetaAccount = (account: MetaAdAccount) => {
-    const id = (account.account_id || account.id).replace(/^act_/i, "");
-    setAccountId(id); setAccountIdSource("manual"); setMetaPixels([]); setMetaPages([]); setSelectedPixelId(""); setSelectedPageId("");
-    resetMetaResults(); setError(null);
-  };
-
-  const handleLoadAccountAssets = async () => {
-    if (!accountId || !token || resourceBusy) return;
-    setResourceBusy("assets"); setError(null); setApiLogs([]); setShowApiLogs(true); setLogCopied(false);
-    try {
-      const accountAccess = await verifyAdAccountAccess({ accountId, token, version: graphVersion, onLog: (entry) => setApiLogs((current) => [...current, entry]) });
-      const [pixels, pages] = await Promise.all([
-        fetchAdAccountPixels({ accountId, token, version: graphVersion, onLog: (entry) => setApiLogs((current) => [...current, entry]) }),
-        fetchAdAccountPages({ accountId, businessId: selectedAccount?.business?.id || accountAccess.business?.id, token, version: graphVersion, onLog: (entry) => setApiLogs((current) => [...current, entry]) }),
-      ]);
-      setMetaPixels([...pixels].sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id, undefined, { numeric: true })));
-      setMetaPages([...pages].sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id, undefined, { numeric: true })));
-      if (!pages.length) setError("Кабинет доступен, но Meta не вернула ни одной Facebook Page из доступных источников. Назначьте нужную страницу системному пользователю в Business Settings и проверьте business_management в токене.");
-      else if (!pixels.length) setError("Страницы получены, но Meta не вернула пиксели. Проверьте назначение пикселя системному пользователю.");
-    } catch (reason) {
-      setMetaPixels([]); setMetaPages([]);
-      setError(reason instanceof Error ? reason.message : "Не удалось получить пиксели и страницы кабинета.");
-    } finally { setResourceBusy(null); }
-  };
-
-  const handleApplyCampaignSettings = () => {
-    if (!csv) return;
-    const countries = splitListValue(countriesInput).map((country) => country.toLocaleUpperCase());
-    const invalidCountries = countries.filter((country) => !/^[A-Z]{2}$/.test(country));
-    if (csv.headers.includes("Countries") && !countries.length) { setError("Добавьте хотя бы одну страну в формате двухбуквенного кода, например IT, ES или DE."); return; }
-    if (invalidCountries.length) { setError(`Некорректные коды стран: ${invalidCountries.join(", ")}. Используйте двухбуквенные ISO-коды.`); return; }
-    const result = applyCampaignCsvSettings(csv, {
-      countries: csv.headers.includes("Countries") ? countries : undefined,
-      locales: csv.headers.includes("Locales") ? splitListValue(localesInput) : undefined,
-      pixelId: selectedPixelId || undefined,
-      pageId: selectedPageId || undefined,
-    });
-    setCampaignUndoCsv(csv); setCsv(result.csv); setCampaignUpdateReport(result.report); setError(null);
-  };
-
-  const undoCampaignSettings = () => {
-    if (!campaignUndoCsv) return;
-    setCsv(campaignUndoCsv); setCountriesInput(csvListValue(campaignUndoCsv, "Countries")); setLocalesInput(csvListValue(campaignUndoCsv, "Locales"));
-    setCampaignUndoCsv(null); setCampaignUpdateReport(null); setError(null);
-  };
 
   const handleMetaSync = async () => {
     if (!csv || blockers || !accountId.trim() || !token.trim()) return;
@@ -678,7 +587,7 @@ export default function Home() {
   };
   const clearToken = () => {
     try { window.sessionStorage.removeItem(TOKEN_STORAGE_KEY); } catch {}
-    setToken(""); setMetaAccounts([]); setUnavailableAccountCount(0); setMetaPixels([]); setMetaPages([]); setSelectedPixelId(""); setSelectedPageId(""); resetMetaResults();
+    setToken(""); resetMetaResults();
   };
   const reset = () => {
     clearPreviewUrls();
@@ -687,8 +596,6 @@ export default function Home() {
     setManualOverrides({}); setError(null); setFilter("all"); setQuery(""); setAccountId("");
     setCleanupReport(null); setSourceFormat(""); setRenameFind(""); setRenameReplace(""); setRenameScopes(defaultNamingScopes); setRenameReport(null); setRenameUndoCsv(null);
     setAccountIdSource(""); setMetaImages([]); setMetaMatches([]); setMetaCheckedAt(null); setApiLogs([]); setShowApiLogs(false); setLogCopied(false);
-    setResourceBusy(null); setMetaAccounts([]); setUnavailableAccountCount(0); setAccountSearch(""); setMetaPixels([]); setMetaPages([]);
-    setSelectedPixelId(""); setSelectedPageId(""); setCountriesInput(""); setLocalesInput(""); setCampaignUpdateReport(null); setCampaignUndoCsv(null);
   };
 
   return <main>
@@ -757,17 +664,7 @@ export default function Home() {
         </div>
 
         <section className="instruction-section">
-          <div className="instruction-section-title"><span>05</span><div><b>Настройте ресурсы и таргетинг CSV</b><small>Необязательный раздел перед скачиванием</small></div></div>
-          <ol className="instruction-checklist">
-            <li><b>1</b><span>Нажмите <strong>«Показать мои кабинеты»</strong>. Сервис покажет все кабинеты, доступные токену: активные будут зелёными, а заблокированные или недоступные — красными и недоступными для выбора.</span></li>
-            <li><b>2</b><span>Выберите кабинет карточкой или оставьте ручной ID, затем нажмите <strong>«Загрузить пиксели и страницы»</strong>.</span></li>
-            <li><b>3</b><span>Выберите пиксель и Facebook Page. Страницы отображаются с названием, ID и доступной иконкой.</span></li>
-            <li><b>4</b><span>Отредактируйте <code>Countries</code> двухбуквенными кодами и <code>Locales</code>, затем нажмите <strong>«Применить к CSV»</strong>. Изменения можно отменить.</span></li>
-          </ol>
-        </section>
-
-        <section className="instruction-section">
-          <div className="instruction-section-title"><span>06</span><div><b>Импортируйте результат в Meta</b><small>Финальная проверка перед публикацией</small></div></div>
+          <div className="instruction-section-title"><span>05</span><div><b>Импортируйте результат в Meta</b><small>Финальная проверка перед публикацией</small></div></div>
           <ol className="instruction-checklist">
             <li><b>1</b><span>В Ads Manager выберите импорт объявлений и загрузите готовый CSV из Creative Extractor.</span></li>
             <li><b>2</b><span>Откройте Preview и проверьте названия, изображения, кабинеты и отсутствие ошибок <code>Image Not Found</code>.</span></li>
@@ -886,34 +783,12 @@ export default function Home() {
           </div>
           {metaMode === "upload" && <div className="automation-risk-note"><ShieldCheck size={16} /><span>Одновременно отправляются не более трёх файлов. Image Hash приходит в ответе Meta без дополнительного запроса. Старый режим поиска уже загруженных изображений сохранён как резервный.</span></div>}
           <div className="api-form">
-            <label className="api-field"><span><Database size={15} /> ID рекламного кабинета <HelpTip label="ID рекламного кабинета">Введите ID кабинета или вставьте целиком ссылку из Ads Manager — сервис возьмёт значение параметра act=. Значения business_id и global_scope_id не являются ID рекламного кабинета. Автоматически найденный по неймингу ID обязательно проверьте.</HelpTip></span><input value={accountId} autoComplete="off" placeholder="ID или ссылка из Ads Manager" onChange={(event) => { const extracted = extractAdAccountId(event.target.value); setAccountId(extracted); setAccountIdSource("manual"); setMetaPixels([]); setMetaPages([]); setSelectedPixelId(""); setSelectedPageId(""); resetMetaResults(); if (event.target.value.trim() && !extracted) setError("Не удалось найти ID кабинета. Вставьте числовой ID или ссылку Ads Manager с параметром act=."); else setError(null); }} /><small>{accountIdSource === "auto" ? "Определён по неймингу — обязательно сверьте с параметром act= в Ads Manager" : "Можно вставить ID или полную ссылку Ads Manager; используется только параметр act="}</small></label>
-            <label className="api-field api-field--token"><span className="api-field-heading"><span><KeyRound size={15} /> Access token <HelpTip label="Meta Access Token">Для поиска достаточно ads_read или ads_management. Для загрузки изображений нужен ads_management и право управления выбранным кабинетом. Токен не попадает в CSV и хранится только в sessionStorage текущей вкладки.</HelpTip></span>{token && <button type="button" className="clear-token-button" onClick={clearToken} title="Удалить токен из текущей вкладки"><Trash2 size={13} /> Удалить</button>}</span><textarea value={token} autoComplete="off" spellCheck={false} placeholder={metaMode === "upload" ? "Вставьте токен с ads_management" : "Вставьте токен с ads_read или ads_management"} onChange={(event) => { setToken(event.target.value.trim()); setMetaAccounts([]); setUnavailableAccountCount(0); setMetaPixels([]); setMetaPages([]); setSelectedPixelId(""); setSelectedPageId(""); resetMetaResults(); }} /><small>{metaMode === "upload" ? "Для загрузки нужен ads_management и доступ к кабинету" : "Передаётся напрямую на graph.facebook.com"}</small></label>
-            <label className="api-field"><span><Link2 size={15} /> Версия API <HelpTip label="Версия Meta Graph API">Используйте актуальную версию по умолчанию. Старшую сохранённую версию выбирайте только если ваше Meta-приложение ещё не поддерживает текущую.</HelpTip></span><select value={graphVersion} onChange={(event) => { setGraphVersion(event.target.value as GraphVersion); setMetaAccounts([]); setMetaPixels([]); setMetaPages([]); resetMetaResults(); }}><option value="v26.0">v26.0</option><option value="v25.0">v25.0</option></select><small>По умолчанию используется текущая v26.0</small></label>
+            <label className="api-field"><span><Database size={15} /> ID рекламного кабинета <HelpTip label="ID рекламного кабинета">Введите ID кабинета или вставьте целиком ссылку из Ads Manager — сервис возьмёт значение параметра act=. Значения business_id и global_scope_id не являются ID рекламного кабинета. Автоматически найденный по неймингу ID обязательно проверьте.</HelpTip></span><input value={accountId} autoComplete="off" placeholder="ID или ссылка из Ads Manager" onChange={(event) => { const extracted = extractAdAccountId(event.target.value); setAccountId(extracted); setAccountIdSource("manual"); resetMetaResults(); if (event.target.value.trim() && !extracted) setError("Не удалось найти ID кабинета. Вставьте числовой ID или ссылку Ads Manager с параметром act=."); else setError(null); }} /><small>{accountIdSource === "auto" ? "Определён по неймингу — обязательно сверьте с параметром act= в Ads Manager" : "Можно вставить ID или полную ссылку Ads Manager; используется только параметр act="}</small></label>
+            <label className="api-field api-field--token"><span className="api-field-heading"><span><KeyRound size={15} /> Access token <HelpTip label="Meta Access Token">Для поиска достаточно ads_read или ads_management. Для загрузки изображений нужен ads_management и право управления выбранным кабинетом. Токен не попадает в CSV и хранится только в sessionStorage текущей вкладки.</HelpTip></span>{token && <button type="button" className="clear-token-button" onClick={clearToken} title="Удалить токен из текущей вкладки"><Trash2 size={13} /> Удалить</button>}</span><textarea value={token} autoComplete="off" spellCheck={false} placeholder={metaMode === "upload" ? "Вставьте токен с ads_management" : "Вставьте токен с ads_read или ads_management"} onChange={(event) => { setToken(event.target.value.trim()); resetMetaResults(); }} /><small>{metaMode === "upload" ? "Для загрузки нужен ads_management и доступ к кабинету" : "Передаётся напрямую на graph.facebook.com"}</small></label>
+            <label className="api-field"><span><Link2 size={15} /> Версия API <HelpTip label="Версия Meta Graph API">Используйте актуальную версию по умолчанию. Старшую сохранённую версию выбирайте только если ваше Meta-приложение ещё не поддерживает текущую.</HelpTip></span><select value={graphVersion} onChange={(event) => { setGraphVersion(event.target.value as GraphVersion); resetMetaResults(); }}><option value="v26.0">v26.0</option><option value="v25.0">v25.0</option></select><small>По умолчанию используется текущая v26.0</small></label>
             {metaMode === "find" ? <button className="start-button" type="button" disabled={blockers || !accountId || !token || Boolean(busy)} onClick={handleMetaSync}>{busy === "meta" ? <Loader2 className="spin" size={18} /> : <Search size={18} />}<span>{busy === "meta" ? "Ищем креативы…" : "Найти креативы"}</span></button>
               : <button className="start-button start-button--upload" type="button" disabled={blockers || !accountId || !token || Boolean(busy) || imageCount === 0 || uploadComplete} onClick={() => handleMetaUpload(uploadStats.failed > 0)}>{busy === "meta-upload" ? <Loader2 className="spin" size={18} /> : uploadComplete ? <Check size={18} /> : uploadStats.failed > 0 ? <RotateCcw size={18} /> : <UploadCloud size={18} />}<span>{busy === "meta-upload" ? (uploadStats.active ? `Загрузка ${uploadStats.uploaded + uploadStats.failed + uploadStats.active}/${uploadStats.total}` : "Проверяем доступ к кабинету…") : uploadComplete ? "Все загружено" : uploadStats.failed > 0 ? `Повторить ошибки (${uploadStats.failed})` : `Загрузить изображения (${imageCount})`}</span></button>}
           </div>
-          <section className="resource-lab">
-            <div className="resource-lab-head"><div><span className="feature-chip">Настройки</span><h3>Ресурсы кабинета и настройки CSV</h3><p>Можно оставить ручной ID как раньше или получить доступные ресурсы через токен. Активные кабинеты отмечены зелёным, заблокированные и недоступные — красным.</p></div><button type="button" className="resource-action" disabled={!token || Boolean(resourceBusy) || Boolean(busy)} onClick={handleDiscoverAccounts}>{resourceBusy === "accounts" ? <Loader2 className="spin" size={15} /> : <Database size={15} />}{resourceBusy === "accounts" ? "Получаем кабинеты…" : "Показать мои кабинеты"}</button></div>
-
-            {metaAccounts.length > 0 && <div className="account-browser">
-              <div className="account-browser-toolbar"><label><Search size={14} /><input value={accountSearch} onChange={(event) => setAccountSearch(event.target.value)} placeholder="Поиск по названию или ID" /></label><span>Всего: {metaAccounts.length}{unavailableAccountCount ? ` · недоступных: ${unavailableAccountCount}` : ""}</span></div>
-              <div className="account-card-grid">{filteredAccounts.map((account) => {
-                const id = (account.account_id || account.id).replace(/^act_/i, "");
-                const isActive = isMetaAdAccountActive(account);
-                return <button type="button" key={account.id} className={[id === accountId ? "selected" : "", !isActive ? "unavailable" : ""].filter(Boolean).join(" ")} aria-disabled={!isActive} title={isActive ? "Выбрать рекламный кабинет" : "Недоступный кабинет показан только для информации"} onClick={() => { if (isActive) selectMetaAccount(account); }}><span className="account-status-dot" /><span><b>{account.name || `Кабинет ${id}`}</b><small>act_{id}</small><em>{isActive ? ([account.currency, account.timezone_name].filter(Boolean).join(" · ") || "Активен") : metaAdAccountStatusLabel(account)}</em></span>{id === accountId && <CheckCircle2 size={17} />}</button>;
-              })}</div>
-            </div>}
-
-            <div className="selected-resource-row"><div><Database size={17} /><span><b>{selectedAccount?.name || (accountId ? `Кабинет act_${accountId}` : "Кабинет не выбран")}</b><small>{selectedAccount ? `${selectedAccount.currency || "Валюта не указана"} · ${selectedAccount.timezone_name || "Часовой пояс не указан"}` : "Можно указать ID вручную в поле выше"}</small></span></div><button type="button" className="resource-action resource-action--secondary" disabled={!accountId || !token || Boolean(resourceBusy) || Boolean(busy)} onClick={handleLoadAccountAssets}>{resourceBusy === "assets" ? <Loader2 className="spin" size={15} /> : <RefreshCw size={15} />}{resourceBusy === "assets" ? "Получаем ресурсы…" : "Загрузить пиксели и страницы"}</button></div>
-
-            <div className="campaign-editor-grid">
-              <label className="campaign-editor-field"><span>Страны <HelpTip label="Countries">Двухбуквенные ISO-коды через запятую. Настройка будет применена ко всем строкам CSV в колонке Countries.</HelpTip></span><textarea value={countriesInput} onChange={(event) => setCountriesInput(event.target.value)} placeholder="IT, ES, DE" /><small>Добавляйте и удаляйте коды через запятую</small></label>
-              <label className="campaign-editor-field"><span>Языки аудитории <HelpTip label="Locales">Значения колонки Locales через запятую, например Italian или English. Пустое поле очистит языковое ограничение.</HelpTip></span><textarea value={localesInput} onChange={(event) => setLocalesInput(event.target.value)} placeholder="Italian, English" /><small>Это таргетинг Locales, а не язык названия креатива</small></label>
-              <label className="campaign-editor-field"><span>Пиксель кабинета</span><select value={selectedPixelId} onChange={(event) => setSelectedPixelId(event.target.value)}><option value="">Не изменять пиксель</option>{metaPixels.map((pixel) => <option key={pixel.id} value={pixel.id}>{pixel.name || "Без названия"} · {pixel.id}</option>)}</select><small>{metaPixels.length ? `Доступно пикселей: ${metaPixels.length}` : "Сначала загрузите ресурсы выбранного кабинета"}</small></label>
-              <div className="campaign-editor-field page-picker-field"><span>Facebook Page</span>{metaPages.length ? <div className="page-picker-grid">{metaPages.map((page) => <button type="button" key={page.id} className={selectedPageId === page.id ? "selected" : ""} onClick={() => setSelectedPageId(page.id)}><span className="page-avatar" style={page.picture?.data?.url ? { backgroundImage: `url(${page.picture.data.url})` } : undefined}>{!page.picture?.data?.url && (page.name?.slice(0, 1).toLocaleUpperCase() || "P")}</span><span><b>{page.name || "Страница без названия"}</b><small>{page.id}</small></span>{selectedPageId === page.id && <Check size={14} />}</button>)}</div> : <div className="empty-resource">Страницы не получены. Назначьте Page системному пользователю и проверьте права business_management; затем загрузите ресурсы повторно.</div>}</div>
-            </div>
-            <div className="campaign-editor-actions"><div>{campaignUpdateReport && <span className="campaign-update-result"><CheckCircle2 size={15} /> Изменено ячеек: {campaignUpdateReport.changedCells} · строк: {campaignUpdateReport.changedRows}{campaignUpdateReport.missingColumns.length ? ` · отсутствуют колонки: ${campaignUpdateReport.missingColumns.join(", ")}` : ""}</span>}</div>{campaignUndoCsv && <button type="button" className="undo-rename" onClick={undoCampaignSettings}><RotateCcw size={14} /> Отменить настройки</button>}<button type="button" className="resource-apply" onClick={handleApplyCampaignSettings}><Check size={15} /> Применить к CSV</button></div>
-          </section>
           {videoCount > 0 && <div className="notice notice--error"><AlertCircle size={18} /><span>В текущем режиме поддерживаются только изображения. Для {videoCount} видео нужен отдельный запрос AdVideo и отдельная колонка Video ID.</span></div>}
           {metaMode === "upload" && uploadResults.length > 0 && <div className="upload-progress-card">
             <div><span><b>{busy === "meta-upload" ? "Загружаем изображения" : uploadStats.failed ? "Загрузка завершена с ошибками" : "Все изображения загружены"}</b><small>{uploadStats.uploaded} успешно · {uploadStats.failed} ошибок · всего {uploadStats.total}</small></span><strong>{uploadStats.total ? Math.round(((uploadStats.uploaded + uploadStats.failed) / uploadStats.total) * 100) : 0}%</strong></div>
