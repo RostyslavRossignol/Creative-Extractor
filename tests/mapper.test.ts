@@ -7,7 +7,9 @@ import {
   createCreativeFile,
   createOutputRows,
   detectColumns,
+  LANGUAGE_DEFINITIONS,
   META_CLEANUP_COLUMNS,
+  normalizeForTokens,
   parseCsvFile,
   replaceInNamingColumns,
   serializeCsv,
@@ -139,21 +141,187 @@ test("recognizes Swedish regardless of case and accepts standard and common code
 });
 
 test("matches an arbitrary language marker without case sensitivity", () => {
-  const file = createCreativeFile("catalan_4_gb_uniq5TE$rVU(3n4v_428356.jpg", 100)!;
-  assert.equal(file.languageCode, "CATALAN");
+  const file = createCreativeFile("klingon_4_gb_uniq5TE$rVU(3n4v_428356.jpg", 100)!;
+  assert.equal(file.languageCode, "KLINGON");
   assert.equal(file.variant, 4);
 
   const csv: ParsedCsv = {
     fileName: "meta.csv",
     headers: ["Ad Name", "Image File Name", "Image Hash"],
-    rows: [["GOLD_FG_mReg_80fs[play]_Catalan_4_1422146908876280", "", ""]],
+    rows: [["GOLD_FG_mReg_80fs[play]_Klingon_4_1422146908876280", "", ""]],
     delimiter: ",", linebreak: "\r\n", hadBom: true, encoding: "utf-8", warnings: [],
   };
   const mappings = buildMappings(csv, [file], detectColumns(csv.headers), options);
-  assert.equal(mappings[0].analysis.languageCode, "CATALAN");
+  assert.equal(mappings[0].analysis.languageCode, "KLINGON");
   assert.equal(mappings[0].analysis.variant, 4);
   assert.equal(mappings[0].status, "ready");
   assert.equal(mappings[0].file?.name, file.name);
+});
+
+test("recognizes Catalan as a known language in the uploaded ad and file names", () => {
+  const file = createCreativeFile("catalan_4_gb_uniq5TE$rVU(3n4v_428356.jpg", 100)!;
+  assert.equal(file.languageCode, "CA");
+  assert.equal(file.variant, 4);
+  const csv: ParsedCsv = {
+    fileName: "meta.csv",
+    headers: ["Ad Name", "Image File Name", "Image Hash"],
+    rows: [["GOLD_FG_mReg_80fs[play]_Catalan_4_1422146908876280", "", ""], ["GOLD_FG_CA_4_1422146908876280", "", ""]],
+    delimiter: ",", linebreak: "\r\n", hadBom: true, encoding: "utf-8", warnings: [],
+  };
+  const mappings = buildMappings(csv, [file], detectColumns(csv.headers), options);
+  assert.deepEqual(mappings.map((mapping) => mapping.status), ["ready", "ready"]);
+  assert.deepEqual(mappings.map((mapping) => mapping.file?.name), [file.name, file.name]);
+});
+
+test("treats a capital code, an English name and any Russian or Ukrainian form of a language as the same language", () => {
+  for (const name of ["Promo_SK_1", "Promo_Slovak_1", "Promo_slovakian_1", "Словацкий_1", "словацкое_1", "СЛОВАЦКАЯ_1", "словацком_1", "словацька_1", "Slovakia_1", "Словакия_1", "slk_1"]) {
+    assert.deepEqual([analyzeName(name).languageCode, analyzeName(name).variant], ["SK", 1], name);
+  }
+  for (const name of ["Promo_SL_2", "Slovenian_2", "Словенский_2", "словенское_2", "Словения_2", "Slovenia_2"]) {
+    assert.equal(analyzeName(name).languageCode, "SL", name);
+  }
+  assert.equal(analyzeName("Итальянское_3").languageCode, "IT");
+  assert.equal(analyzeName("Италия_3").languageCode, "IT");
+  assert.equal(analyzeName("німецькою_3").languageCode, "DE");
+  assert.equal(analyzeName("Germany_3").languageCode, "DE");
+  assert.equal(analyzeName("Icelandic_1").languageCode, "IS");
+  assert.equal(analyzeName("Belarusian_1").languageCode, "BE");
+  assert.equal(analyzeName("Irish_1").languageCode, "GA");
+});
+
+test("maps an ad and a creative that name the same language differently", () => {
+  const csv: ParsedCsv = {
+    fileName: "meta.csv",
+    headers: ["Ad Name", "Image File Name"],
+    rows: [["Brand_SK_1_1010735508109581", ""], ["Brand_Slovak_2_1010735508109581", ""], ["Brand_Словацкий_3_1010735508109581", ""]],
+    delimiter: ",", linebreak: "\n", hadBom: false, encoding: "utf-8", warnings: [],
+  };
+  const files = ["словацкое_1_uniq_1.jpg", "SK-2.png", "slovakia_3.jpg"].map((name) => createCreativeFile(name, 1)!);
+  const mappings = buildMappings(csv, files, detectColumns(csv.headers), options);
+  assert.deepEqual(mappings.map((mapping) => mapping.file?.name), ["словацкое_1_uniq_1.jpg", "SK-2.png", "slovakia_3.jpg"]);
+});
+
+test("reads Meta locale names, regional variants and a variant glued to the language", () => {
+  assert.equal(analyzeName("English (UK)").languageCode, "EN");
+  assert.equal(analyzeName("English_US_2").languageCode, "EN");
+  assert.equal(analyzeName("Spanish (Spain)").languageCode, "ES");
+  assert.equal(analyzeName("French (Canada)").languageCode, "FR");
+  assert.equal(analyzeName("Norwegian (bokmal)").languageCode, "NO");
+  assert.equal(analyzeName("Portuguese (Brazil)").languageCode, "PT-BR");
+  assert.equal(analyzeName("Portuguese_Brasil_1").languageCode, "PT-BR");
+  assert.deepEqual([analyzeName("Slovak2.jpg").languageCode, analyzeName("Slovak2.jpg").variant], ["SK", 2]);
+  assert.deepEqual([analyzeName("creo_SK01.jpg").languageCode, analyzeName("creo_SK01.jpg").variant], ["SK", 1]);
+});
+
+test("accepts short codes that are ordinary words only when written in capitals", () => {
+  assert.equal(analyzeName("creative_IS_1.jpg").languageCode, "IS");
+  assert.equal(analyzeName("creative_CA_1.jpg").languageCode, "CA");
+  assert.equal(analyzeName("this_is_new_1.jpg").languageCode, null);
+  assert.equal(analyzeName("cat_1.jpg").languageCode, null);
+  assert.equal(analyzeName("promo_geo_1.jpg").languageCode, null);
+});
+
+test("prefers a language name over a stray code or a country", () => {
+  assert.equal(analyzeName("Brand_UA_Russian_1").languageCode, "RU");
+  assert.equal(analyzeName("Brand_ES_Italian_3").languageCode, "IT");
+  assert.equal(analyzeName("Brand_Spain_Catalan_1").languageCode, "CA");
+  assert.equal(analyzeName("Brand_US_Spanish_2").languageCode, "ES");
+  assert.deepEqual(analyzeName("Brand_IT_ES_1").ambiguousLanguages, ["IT", "ES"]);
+});
+
+test("ignores dates and keeps dots inside ad names", () => {
+  assert.deepEqual([analyzeName("Brand_Italian_17-08_3_123").languageCode, analyzeName("Brand_Italian_17-08_3_123").variant], ["IT", 3]);
+  assert.deepEqual([analyzeName("Brand v1.2 Italian 3").languageCode, analyzeName("Brand v1.2 Italian 3").variant], ["IT", 3]);
+  assert.equal(analyzeName("Brand_Italian_1-3").variant, 1);
+});
+
+test("keeps the alias table unambiguous", () => {
+  const exact = new Map<string, string>();
+  const stems: Array<{ stem: string; code: string }> = [];
+  for (const definition of LANGUAGE_DEFINITIONS) {
+    for (const raw of [...definition.aliases, ...(definition.countries ?? [])]) {
+      const text = normalizeForTokens(raw.replace(/^=|\*$/g, ""));
+      if (raw.endsWith("*")) {
+        assert.ok([...text].length >= 4, `stem too short: ${raw}`);
+        stems.push({ stem: text, code: definition.code });
+        continue;
+      }
+      const owner = exact.get(text);
+      assert.ok(!owner || owner === definition.code, `alias ${raw} belongs to ${owner} and ${definition.code}`);
+      exact.set(text, definition.code);
+    }
+  }
+  for (const a of stems) for (const b of stems) {
+    if (a.code !== b.code) assert.ok(!a.stem.startsWith(b.stem), `stem ${a.stem} (${a.code}) overlaps ${b.stem} (${b.code})`);
+  }
+});
+
+test("matches any word shared by an ad and a creative and gives each ad its own creative", () => {
+  const csv: ParsedCsv = {
+    fileName: "meta.csv",
+    headers: ["Ad Name", "Image File Name"],
+    rows: [["Promo_бой_1_1010735508109581", ""], ["Promo_бой_2_1010735508109581", ""], ["Promo_бой_3_1010735508109581", ""]],
+    delimiter: ",", linebreak: "\n", hadBom: false, encoding: "utf-8", warnings: [],
+  };
+  const files = ["бой_a.jpg", "бой_b.jpg", "бой_c.jpg"].map((name) => createCreativeFile(name, 1)!);
+  const mappings = buildMappings(csv, files, detectColumns(csv.headers), { ...options, sequentialFallback: true });
+  assert.deepEqual(mappings.map((mapping) => mapping.status), ["ready", "ready", "ready"]);
+  assert.equal(new Set(mappings.map((mapping) => mapping.file?.id)).size, 3);
+  assert.match(mappings[0].reason, /бой/);
+  assert.equal(mappings[0].analysis.languageCode, "БОЙ");
+
+  const strict = buildMappings(csv, files, detectColumns(csv.headers), options);
+  assert.deepEqual(strict.map((mapping) => mapping.status), ["ambiguous", "ambiguous", "ambiguous"]);
+  assert.match(strict[0].reason, /бой.*3/);
+});
+
+test("matches a shared word even when it is not right before the number", () => {
+  const csv: ParsedCsv = {
+    fileName: "meta.csv",
+    headers: ["Ad Name", "Image File Name"],
+    rows: [["Gamboria_2_boy_1_1010735508109581", ""], ["Gamboria_2_boy_2_1010735508109581", ""], ["Gamboria_2_girl_1_1010735508109581", ""]],
+    delimiter: ",", linebreak: "\n", hadBom: false, encoding: "utf-8", warnings: [],
+  };
+  const files = ["boy-final-2.jpg", "BOY final 1.jpg", "girl-1-copy.jpg"].map((name) => createCreativeFile(name, 1)!);
+  const mappings = buildMappings(csv, files, detectColumns(csv.headers), options);
+  assert.deepEqual(mappings.map((mapping) => mapping.file?.name), ["BOY final 1.jpg", "boy-final-2.jpg", "girl-1-copy.jpg"]);
+});
+
+test("uses extra shared words to choose between files of one language", () => {
+  const csv: ParsedCsv = {
+    fileName: "meta.csv",
+    headers: ["Ad Name", "Image File Name"],
+    rows: [["Brand_Slovak_girl_1", ""], ["Brand_Slovak_boy_1", ""], ["Brand_Slovak_boy", ""], ["Brand_Slovak_girl", ""]],
+    delimiter: ",", linebreak: "\n", hadBom: false, encoding: "utf-8", warnings: [],
+  };
+  const files = ["sk_boy_1.jpg", "sk_girl_1.jpg"].map((name) => createCreativeFile(name, 1)!);
+  const mappings = buildMappings(csv, files, detectColumns(csv.headers), options);
+  assert.deepEqual(mappings.map((mapping) => mapping.file?.name), ["sk_girl_1.jpg", "sk_boy_1.jpg", "sk_boy_1.jpg", "sk_girl_1.jpg"]);
+});
+
+test("pairs rows and files by shared words before sequential order", () => {
+  const csv: ParsedCsv = {
+    fileName: "meta.csv",
+    headers: ["Ad Name", "Image File Name"],
+    rows: [["Brand_Slovak_girl_1", ""], ["Brand_Slovak_boy_2", ""]],
+    delimiter: ",", linebreak: "\n", hadBom: false, encoding: "utf-8", warnings: [],
+  };
+  const files = ["slovak_boy.jpg", "slovak_girl.jpg"].map((name) => createCreativeFile(name, 1)!);
+  const mappings = buildMappings(csv, files, detectColumns(csv.headers), { ...options, sequentialFallback: true });
+  assert.deepEqual(mappings.map((mapping) => mapping.file?.name), ["slovak_girl.jpg", "slovak_boy.jpg"]);
+});
+
+test("does not give a recognised language row an unrelated file through shared words", () => {
+  const csv: ParsedCsv = {
+    fileName: "meta.csv",
+    headers: ["Ad Name", "Image File Name"],
+    rows: [["Gamboria_Slovak_1", ""], ["Gamboria_Slovak_2", ""], ["Gamboria_Slovak_3", ""]],
+    delimiter: ",", linebreak: "\n", hadBom: false, encoding: "utf-8", warnings: [],
+  };
+  const files = ["slovak_1.jpg", "slovak_2.jpg", "gamboria_logo.jpg"].map((name) => createCreativeFile(name, 1)!);
+  const mappings = buildMappings(csv, files, detectColumns(csv.headers), { ...options, sequentialFallback: true });
+  assert.deepEqual(mappings.map((mapping) => mapping.status), ["ready", "ready", "missing"]);
+  assert.equal(mappings[2].file, null);
 });
 
 test("does not treat common structural words as arbitrary languages", () => {
